@@ -916,7 +916,7 @@ EOF
     fi
     echo -e "${red}自测失败：本机连不通自己的 Reality 节点${re}"
     echo -e "${yellow}最常见原因：伪装域名 $sni 或它的 443 端口在这台机器上不可达，或者它不支持 REALITY 需要的 TLS1.3+X25519。${re}"
-    echo -e "${yellow}已知可用的备选：www.cloudflare.com / www.apple.com / www.yahoo.com${re}"
+    echo -e "${yellow}已知可用的备选：www.amd.com / www.apple.com / www.yahoo.com / www.cloudflare.com${re}"
     echo -e "${yellow}换一个重装即可（菜单 2 -> 1），不用卸载。${re}"
     [ -s /var/log/xray/error.log ] && { echo -e "${yellow}服务端日志:${re}"; tail -3 /var/log/xray/error.log; }
     [ -s /tmp/reality-selftest.log ] && { echo -e "${yellow}客户端日志:${re}"; tail -3 /tmp/reality-selftest.log; }
@@ -1699,8 +1699,8 @@ while true; do
                         sni=""
                         sni_tries=0
                         while [ -z "$sni" ]; do
-                            read -p $'\033[1;35m请输入伪装域名 SNI (回车默认 www.cloudflare.com): \033[0m' sni_input
-                            [ -z "$sni_input" ] && sni_input="www.cloudflare.com"
+                            read -p $'\033[1;35m请输入伪装域名 SNI (回车默认 www.amd.com): \033[0m' sni_input
+                            [ -z "$sni_input" ] && sni_input="www.amd.com"
                             if timeout 6 bash -c "exec 3<>/dev/tcp/$sni_input/443" 2>/dev/null; then
                                 sni="$sni_input"
                             else
