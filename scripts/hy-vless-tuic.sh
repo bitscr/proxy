@@ -112,6 +112,116 @@ PROXY_MIN_FREE_MB="${PROXY_MIN_FREE_MB:-}" # 手动指定可用磁盘阈值（MB
 
 ENV_OS=""; ENV_INIT=""; ENV_ARCH=""; ENV_MUSL=0; ENV_RAM_MB=0; ENV_DISK_FREE_MB=0; ENV_LOWMEM=0
 
+# ============================================================================
+# 内核网络调优：BBR + fq（Reality/TCP 用）+ UDP 缓冲（Hysteria2/Tuic 用）
+# 全部逐项探测可用性，缺了就跳过——不允许因为调优把安装搞挂
+# ============================================================================
+
+# 写 sysctl：/etc/sysctl.d 优先，不行就 /etc/sysctl.conf，再不行直接 /proc（重启失效但本次有效）
+# 注意：/etc 写成功了但 /proc 写不进去时（受限容器），配置只对下次重启生效——返回值如实反映
+sysctl_apply() { # $1=key $2=value；返回 0=本次运行已生效，1=仅持久化或完全失败
+    local key=$1 val=$2 live=0 saved=0 conf=""
+    # 1) 直接写 /proc 立即生效。
+    # 不能用 [ -w ] 判断：root 对只读挂载的 /proc/sys 也显示"可写"，只有真写一次才知道
+    if printf '%s\n' "$val" > "/proc/sys/$key" 2>/dev/null; then
+        live=1
+    fi
+    # 2) 持久化：能写 /etc/sysctl.d 就写配置文件
+    if [ -d /etc/sysctl.d ] && [ -w /etc/sysctl.d ]; then
+        conf="/etc/sysctl.d/99-proxy-tuning.conf"
+    elif [ -f /etc/sysctl.conf ] && [ -w /etc/sysctl.conf ]; then
+        conf="/etc/sysctl.conf"
+    fi
+    if [ -n "$conf" ]; then
+        # 同键已配置过就不重复追加（幂等）
+        if ! grep -qE "^[[:space:]]*net\.[/.]${key#net/}[[:space:]]*=" "$conf" 2>/dev/null; then
+            printf '\n# added by proxy script\n%s = %s\n' "$(echo "$key" | tr '/' '.')" "$val" >> "$conf" 2>/dev/null && saved=1
+        else
+            saved=1
+        fi
+    fi
+    [ "$live" = 1 ] && return 0
+    return 1
+}
+
+# 当前内核是否已启用 BBR（读可用算法列表 + 当前值）
+bbr_available() {
+    if ! [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]; then
+        return 1
+    fi
+    local avail cur
+    avail=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+    cur=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    case " $avail " in
+        *" bbr "*) return 0 ;;
+    esac
+    # 当前已经是 bbr 也算可用
+    [ "$cur" = "bbr" ] && return 0
+    return 1
+}
+
+# 可选加载 tcp_bbr 模块（很多发行版默认没编进去但可以 modprobe）
+bbr_try_load() {
+    if bbr_available; then return 0; fi
+    if has modprobe; then
+        modprobe tcp_bbr > /dev/null 2>&1
+    fi
+    bbr_available
+}
+
+kernel_tune() {
+    local notes=""
+    # --- BBR + fq（对 Reality/TCP 有效；Hysteria2 是 Brutal、Tuic 自带 BBR，不受此项影响） ---
+    if [ -r /proc/sys/net/ipv4/tcp_congestion_control ]; then
+        if bbr_try_load; then
+            local cur_cc
+            cur_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+            if [ "$cur_cc" = "bbr" ]; then
+                notes="${notes}BBR已是默认 "
+            elif sysctl_apply net/ipv4/tcp_congestion_control bbr; then
+                notes="${notes}BBR已开启 "
+            else
+                notes="${notes}BBR开启失败(可能没权限) "
+            fi
+            # fq：内核没有会写失败，自动跳过
+            if [ "$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)" = "fq" ]; then
+                notes="${notes}fq队列已是默认 "
+            elif sysctl_apply net/core/default_qdisc fq; then
+                notes="${notes}fq队列已开启 "
+            fi
+        else
+            notes="${notes}内核不支持BBR(跳过) "
+        fi
+    else
+        notes="${notes}无TCP调优接口(跳过) "
+    fi
+
+    # --- UDP 缓冲（对 Hysteria2/Tuic 有效）；低内存档用小值，128MB 机器不吃满 16MB ---
+    local buf=16777216
+    [ "$ENV_LOWMEM" = 1 ] && buf=4194304
+    local cur_rm cur_wm
+    cur_rm=$(cat /proc/sys/net/core/rmem_max 2>/dev/null)
+    cur_wm=$(cat /proc/sys/net/core/wmem_max 2>/dev/null)
+    if [ -n "$cur_rm" ] && [ "$cur_rm" -ge "$buf" ] && [ -n "$cur_wm" ] && [ "$cur_wm" -ge "$buf" ]; then
+        notes="${notes}UDP缓冲已达标 "
+    elif sysctl_apply net/core/rmem_max "$buf" && sysctl_apply net/core/wmem_max "$buf"; then
+        if [ "$buf" -ge 1048576 ]; then
+            notes="${notes}UDP缓冲=$((buf/1048576))MB "
+        else
+            notes="${notes}UDP缓冲=$((buf/1024))KB "
+        fi
+    else
+        # LXC/Docker 里 net.* sysctl 常被宿主锁成只读；如果已持久化到 /etc，重启后生效
+        if grep -qs "net.core.rmem_max" /etc/sysctl.d/99-proxy-tuning.conf /etc/sysctl.conf 2>/dev/null; then
+            notes="${notes}UDP缓冲已写入配置,重启后生效 "
+        else
+            notes="${notes}UDP缓冲设不了(宿主限制,LXC常见) "
+        fi
+    fi
+    [ -n "$notes" ] && echo -e "${skyblue}内核调优: ${notes}${re}"
+    return 0
+}
+
 # 安装目录所在分区可用空间（MB）：/ 与 /usr/local 里较小的那个
 disk_free_mb() {
     local a b
@@ -837,6 +947,7 @@ install_reality() {
         press_any_key_to_continue
         return 1
     fi
+    kernel_tune
 
     echo -e "${green}Reality 正在安装中，请稍候...${re}"
 
@@ -1098,6 +1209,7 @@ install_hysteria() {
         press_any_key_to_continue
         return 1
     fi
+    kernel_tune
 
     echo -e "${green}Hysteria2 正在安装中，请稍候...${re}"
 
@@ -1279,6 +1391,7 @@ install_tuic() {
     echo -e "$(env_line)"
     if [ -x "$TU_BIN" ]; then need=10; else need=15; fi
     env_precheck "$need" "Tuic" || { press_any_key_to_continue; return; }
+    kernel_tune
 
     echo -e "${green}Tuic V5 正在安装中，请稍候...${re}"
 
