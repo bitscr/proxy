@@ -309,7 +309,14 @@ env_precheck() {
     return 0
 }
 
-# --- 下载：curl -> wget 回退；直链失败 -> 用 GitHub API 解析官方资产地址 ---
+# --- 下载：curl -> wget 回退。二进制一律从本仓库 vendor/ 取，不用上游 latest ---
+# 固化原因：上游更新会破坏兼容（Xray 26.x 移除 allowInsecure、字段改类型；Hysteria 仓库迁移；
+# TUIC 停更）。版本号写死在 VENDOR_*，改动版本 = 改这几个变量 + 重新放文件。
+VENDOR_RAW_BASE="${VENDOR_RAW_BASE:-https://raw.githubusercontent.com/bitscr/proxy/main/vendor}"
+VENDOR_XRAY_TAG="v26.3.27"
+VENDOR_HY_TAG="app-v2.13.0"
+VENDOR_TUIC_TAG="tuic-server-1.0.0"
+
 http_fetch() { # $1=url $2=输出文件
     if has curl; then
         curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 -o "$2" "$1"
@@ -320,32 +327,65 @@ http_fetch() { # $1=url $2=输出文件
     fi
 }
 
-http_get() { # $1=url [$2=超时秒]
-    local t="${2:-6}"
-    if has curl; then curl -s --max-time "$t" "$1"
-    elif has wget; then wget -q -T "$t" -O - "$1" 2>/dev/null
-    else return 127
+# 取仓库里 vendor/SHA256SUMS（首次使用时拉一次，缓存到内存）
+vendor_sums_load() {
+    [ -n "$VENDOR_SUMS" ] && return 0
+    local f
+    f=$(mktemp) || return 1
+    if ! http_fetch "$VENDOR_RAW_BASE/SHA256SUMS" "$f"; then
+        rm -f "$f"; return 1
+    fi
+    VENDOR_SUMS=$(cat "$f")
+    rm -f "$f"
+    [ -n "$VENDOR_SUMS" ]
+}
+
+# 从清单里查某文件（仓库内相对路径 vendor/...）的期望 sha256
+vendor_expect_sha() { # $1=vendor 内相对路径
+    vendor_sums_load || return 1
+    printf '%s\n' "$VENDOR_SUMS" | awk -v p="vendor/$1" '$2==p {print $1; exit}'
+}
+
+# sha256 计算：sha256sum -> openssl fallback（busybox 环境必需）
+sha256_of() { # $1=文件
+    if has sha256sum; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif has openssl; then
+        openssl dgst -sha256 -r "$1" 2>/dev/null | awk '{print $1}'
+    else
+        return 1
     fi
 }
 
-# 从官方 API 取 release 资产地址（不引入任何第三方镜像）；$2 = 资产名（精确匹配）
-gh_asset_url() { # $1=owner/repo $2=资产名
-    local json pat
-    json=$(http_get "https://api.github.com/repos/$1/releases/latest" 20) || return 1
-    [ -z "$json" ] && return 1
-    pat=$(printf '%s' "$2" | sed 's/\./\\./g')
-    printf '%s' "$json" | tr ',' '\n' \
-        | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | grep -E "/$pat\$" | head -1
-}
-
-download_official() { # $1=直链 $2=owner/repo $3=资产名 $4=输出文件
-    if http_fetch "$1" "$4"; then return 0; fi
-    echo -e "${yellow}直链下载失败，改用 GitHub API 解析同一官方仓库的地址重试...${re}"
-    local alt
-    alt=$(gh_asset_url "$2" "$3") || return 1
-    [ -z "$alt" ] && return 1
-    http_fetch "$alt" "$4"
+# 下载并强校验：从本仓库下载 -> sha256 必须与清单一致，否则拒绝安装。
+# 不提供官方 latest 回退：上游不可控，静默换版本比下载失败更危险。
+vendor_fetch() { # $1=vendor 内相对路径  $2=输出文件
+    local rel=$1 out=$2 want got
+    want=$(vendor_expect_sha "$rel")
+    if [ -z "$want" ]; then
+        echo -e "${red}错误: 校验清单里没有 $rel${re}"
+        echo -e "${yellow}可能是仓库 vendor/SHA256SUMS 未同步，请检查。${re}"
+        return 1
+    fi
+    echo -e "${yellow}正在下载 $rel ...${re}"
+    if ! http_fetch "$VENDOR_RAW_BASE/$rel" "$out"; then
+        echo -e "${red}错误: 从 $VENDOR_RAW_BASE 下载失败${re}"
+        echo -e "${yellow}检查本机网络能否访问 raw.githubusercontent.com（国内可能需要代理）。${re}"
+        return 1
+    fi
+    got=$(sha256_of "$out")
+    if [ -z "$got" ]; then
+        echo -e "${red}错误: 本机没有 sha256sum / openssl，无法校验${re}"
+        return 1
+    fi
+    if [ "$got" != "$want" ]; then
+        echo -e "${red}错误: sha256 校验不通过，文件可能被篡改或下载损坏，已拒绝安装${re}"
+        echo -e "${yellow}期望: $want${re}"
+        echo -e "${yellow}实际: $got${re}"
+        return 1
+    fi
+    echo -e "${green}sha256 校验通过${re}"
+    return 0
 }
 
 # --- 随机值：不依赖 openssl / shuf ---
@@ -729,9 +769,9 @@ install_xray_core() {
         return 1
     fi
     tmp=$(mktemp -d) || return 1
-    echo -e "${yellow}正在下载官方 Xray ($asset)...${re}"
-    if ! download_official "https://github.com/XTLS/Xray-core/releases/latest/download/$asset" "XTLS/Xray-core" "$asset" "$tmp/xray.zip"; then
-        echo -e "${red}错误: 下载 Xray 失败，请检查网络${re}"
+    echo -e "${yellow}正在安装 Xray ${VENDOR_XRAY_TAG} ($asset)，来自本项目 vendor${re}"
+    if ! vendor_fetch "xray/$VENDOR_XRAY_TAG/$asset" "$tmp/xray.zip"; then
+        echo -e "${red}错误: 下载 Xray 失败${re}"
         rm -rf "$tmp"; return 1
     fi
     if ! unzip -oq "$tmp/xray.zip" -d "$tmp"; then
@@ -923,10 +963,329 @@ EOF
     return 1
 }
 
+# 写 VLESS+WS 配置。
+# $1=端口 $2=Host(回源域名/任意) $3=uuid $4=path $5=security(tls|none) $6=SNI/证书CN
+ws_write_config() {
+    local port=$1 ws_host=$2 uuid=$3 path=$4 security=$5 sni=$6
+    local tls_block=""
+    if [ "$security" = "tls" ]; then
+        tls_block="\"tlsSettings\": {
+                    \"certificates\": [
+                        {
+                            \"certificateFile\": \"$XRAY_CFG_DIR/cert.pem\",
+                            \"keyFile\": \"$XRAY_CFG_DIR/key.pem\"
+                        }
+                    ]
+                },"
+    fi
+    mkdir -p "$XRAY_CFG_DIR"
+    cat > "$XRAY_CFG" <<EOF
+{
+    "inbounds": [
+        {
+            "port": $port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "$uuid",
+                        "flow": ""
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "$security",
+                $tls_block
+                "wsSettings": {
+                    "path": "$path",
+                    "headers": {
+                        "Host": "$ws_host"
+                    }
+                }
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom"
+        }
+    ]
+}
+EOF
+    if ! "$XRAY_BIN" -test -c "$XRAY_CFG" >/tmp/xray-test.log 2>&1; then
+        echo -e "${red}错误: 配置校验失败：$(tail -1 /tmp/xray-test.log)${re}"
+        return 1
+    fi
+    return 0
+}
+
+# CF 只代理这 6 个 HTTPS 端口,回源域名场景的节点端口只能从这里面选
+CF_PORTS=(443 2053 2083 2087 2096 8443)
+
+# 从 CF 端口里挑一个本机没被占用的;用户输入若是 CF 端口且空闲则优先。纯函数:只打印端口。
+cf_pick_port() { # $1=用户输入端口(可为空)
+    local input=$1 p
+    if [ -n "$input" ]; then
+        for p in "${CF_PORTS[@]}"; do
+            if [ "$input" = "$p" ] && ! check_port "$p"; then
+                echo "$input"
+                return 0
+            fi
+        done
+    fi
+    for p in "${CF_PORTS[@]}"; do
+        if ! check_port "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo "443"
+}
+
+# 自测用 127.0.0.1 连自己,先验证服务端 TLS/WS/路径可用,与 CF 是否配好无关。
+ws_selftest() { # $1=port $2=uuid $3=path $4=security $5=ServerName/Host(可空)
+    local port=$1 uuid=$2 path=$3 security=$4 sni=$5 tport=1081 out rc
+    local tls_cli=""
+    if [ "$security" = "tls" ]; then
+        # 新版 Xray 移除了 allowInsecure,自签证书只能用 pinnedPeerCertSha256 锁定指纹
+        local pin=""
+        if [ -f "$XRAY_CFG_DIR/cert.pem" ] && has openssl; then
+            pin=$(openssl x509 -in "$XRAY_CFG_DIR/cert.pem" -outform der 2>/dev/null | openssl dgst -sha256 -hex | awk '{print $NF}')
+        fi
+        tls_cli="\"security\": \"tls\",
+                \"tlsSettings\": {
+                    \"serverName\": \"$sni\",${pin:+
+                    \"pinnedPeerCertSha256\": \"$pin\",}
+                    \"fingerprint\": \"chrome\"
+                },"
+    else
+        tls_cli="\"security\": \"none\","
+    fi
+    while check_port "$tport" && [ "$tport" -lt 1090 ]; do tport=$((tport+1)); done
+    cat > /tmp/ws-selftest.json <<EOF
+{
+    "inbounds": [
+        {
+            "port": $tport,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": { "udp": false }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "127.0.0.1",
+                        "port": $port,
+                        "users": [
+                            { "id": "$uuid", "encryption": "none", "flow": "" }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "ws",
+                $tls_cli
+                "wsSettings": {
+                    "path": "$path",
+                    "headers": {
+                        "Host": "${sni:-localhost}"
+                    }
+                }
+            }
+        }
+    ]
+}
+EOF
+    local before=0 after=0
+    [ -f /var/log/xray/access.log ] && before=$(wc -l < /var/log/xray/access.log | tr -d ' ')
+    [ -z "$before" ] && before=0
+    nohup "$XRAY_BIN" -c /tmp/ws-selftest.json >/tmp/ws-selftest.log 2>&1 &
+    local tpid=$!
+    sleep 3
+    out=$(proxy_probe "$tport")
+    rc=$?
+    kill "$tpid" >/dev/null 2>&1
+    rm -f /tmp/ws-selftest.json
+    if [ $rc -eq 0 ]; then
+        case "$out" in
+            "?") echo -e "${green}自测通过：隧道能出网（测试目标返回 204）${re}" ;;
+            *)   echo -e "${green}自测通过：隧道出口 IP $out${re}" ;;
+        esac
+        return 0
+    fi
+    if [ $rc -eq 2 ]; then selftest_skip_no_curl; return 0; fi
+    [ -f /var/log/xray/access.log ] && after=$(wc -l < /var/log/xray/access.log | tr -d ' ')
+    [ -z "$after" ] && after=0
+    if [ "$after" -gt "$before" ]; then
+        echo -e "${yellow}自测结果不确定：隧道握手是成功的（服务端已记录连接），但外网测试目标都没连上${re}"
+        echo -e "${yellow}这通常是本机出网受限，不是节点的问题。请用客户端实际连一次确认。${re}"
+        return 0
+    fi
+    echo -e "${red}自测失败：本机连不通自己的 VLESS+WS 节点${re}"
+    echo -e "${yellow}最常见原因：证书自签但客户端未放行、回源域名解析没指向这台机器、或防火墙没放行 $port 端口。${re}"
+    [ -s /var/log/xray/error.log ] && { echo -e "${yellow}服务端日志:${re}"; tail -3 /var/log/xray/error.log; }
+    [ -s /tmp/ws-selftest.log ] && { echo -e "${yellow}客户端日志:${re}"; tail -3 /tmp/ws-selftest.log; }
+    return 1
+}
+
+# 服务单元:VLESS+WS 也用官方 Xray,同一个二进制
+install_ws_service() {
+    svc_install "xray" "xray" "Xray (VLESS+WS)" \
+        "$XRAY_BIN run -config $XRAY_CFG" "/var/log/xray" "https://github.com/XTLS"
+}
+
 # 安装/覆盖服务单元并启动：systemd / openrc / 无 init 三档（见 svc_install）
 install_reality_service() {
     svc_install "xray" "xray" "Xray (VLESS Reality)" \
         "$XRAY_BIN run -config $XRAY_CFG" "/var/log/xray" "https://github.com/XTLS"
+}
+
+# 一键安装 VLESS+WS(第 4 项)
+# $1=端口 $2=回源域名(空=直连机器 IP)
+install_ws() {
+    local port=$1 origin_host=$2 uuid path host isp node_host node_port link
+    install_soft curl
+    install_soft jq
+    install_soft openssl
+    ensure_netstat
+
+    env_detect
+    echo -e "$(env_line)"
+    if [ -x "$XRAY_BIN" ]; then need=15; else need=60; fi
+    if ! env_precheck "$need" "VLESS+WS"; then
+        press_any_key_to_continue
+        return 1
+    fi
+    kernel_tune
+
+    echo -e "${green}VLESS+WS 正在安装中，请稍候...${re}"
+
+    install_xray_core || return 1
+
+    uuid=$("$XRAY_BIN" uuid 2>/dev/null)
+    [ -z "$uuid" ] && uuid=$(rand_uuid)
+    path="/$(rand_token)"
+
+    # 双模式:
+    #   填回源域名 -> 走 CF:端口必须是 CF 代理的 6 个 HTTPS 端口,源站 TLS(自签证书,CF Full 模式可回源)
+    #   不填       -> 直连:任意端口,WS 明文(security=none),不需要证书
+    local security ws_host_hdr sni_val
+    if [ -n "$origin_host" ]; then
+        security="tls"
+        node_port=$(cf_pick_port "$port")
+        if [ -n "$port" ] && [ "$port" != "$node_port" ]; then
+            echo -e "${yellow}端口 $port 无法用于 CF 回源(不在代理端口列表或已被占用)，已自动改用 $node_port。${re}"
+        fi
+        ws_host_hdr="$origin_host"
+        sni_val="$origin_host"
+        mkdir -p "$XRAY_CFG_DIR"
+        if ! openssl ecparam -name prime256v1 -genkey -noout -out "$XRAY_CFG_DIR/key.pem" 2>/dev/null \
+            || ! openssl req -new -x509 -nodes -days 3650 -subj "/CN=$origin_host" \
+                -key "$XRAY_CFG_DIR/key.pem" -out "$XRAY_CFG_DIR/cert.pem" 2>/dev/null; then
+            echo -e "${red}错误: 自签证书生成失败（需要 openssl）。${re}"
+            echo -e "${yellow}请手动放一对证书到 $XRAY_CFG_DIR/cert.pem 和 key.pem 再重装。${re}"
+            press_any_key_to_continue
+            return 1
+        fi
+    else
+        security="none"
+        node_port=$port
+        ws_host_hdr="$port"
+        sni_val=""
+    fi
+
+    if ! ws_write_config "$node_port" "$( [ -n "$origin_host" ] && echo "$origin_host" || echo "localhost" )" "$uuid" "$path" "$security" "$sni_val"; then
+        press_any_key_to_continue
+        return 1
+    fi
+
+    install_ws_service
+    sleep 2
+
+    host=$(get_public_ip)
+    isp=$(get_isp_name)
+
+    # 节点地址:填了回源域名就用域名,否则用机器 IP
+    if [ -n "$origin_host" ]; then
+        node_host="$origin_host"
+        link="vless://$uuid@$node_host:$node_port?encryption=none&security=tls&type=ws&sni=$sni_val&fp=chrome&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
+    else
+        node_host="$host"
+        link="vless://$uuid@$node_host:$node_port?encryption=none&security=none&type=ws&host=$node_host&path=$path#$isp-VLESS+WS"
+    fi
+    printf '%s\n' "$link" > "$XRAY_LINK"
+
+    echo ""
+    echo -e "${green}VLESS+WS 安装成功！${re}"
+    echo -e "${green}服务状态: $(svc_state "xray" "xray")${re}"
+    if [ -z "$host" ] && [ -z "$origin_host" ]; then
+        echo -e "${red}警告: 探测不到公网 IP（本机可能是内网/NAT 环境）${re}"
+        echo -e "${yellow}请把下面链接里的主机名手动改成你的公网地址再导入客户端。${re}"
+    fi
+    if [ -n "$origin_host" ]; then
+        echo -e "${skyblue}回源域名模式: 节点 = $origin_host:$node_port(CF 代理的 HTTPS 端口，443/2053/2083/2087/2096/8443 中本机空闲的第一个）。${re}"
+        echo -e "${yellow}用之前请确认: ${re}"
+        echo -e "${yellow}  1) $origin_host 已托管在 Cloudflare 且 DNS 点亮橙色云朵(Proxied)。${re}"
+        echo -e "${yellow}  2) Cloudflare SSL/TLS 模式设为 Full(自签证书可)；Full(strict) 需换成 CF Origin CA 证书。${re}"
+        echo -e "${yellow}  3) 本机防火墙放行 $node_port。CF 按“访客端口 → 源站同端口”1:1 回源。${re}"
+        echo -e "${yellow}客户端手动配置时: 地址填 CF 优选IP、端口 $node_port、SNI/Host 填 $origin_host、路径 $path、传输 ws、TLS。${re}"
+    else
+        echo -e "${skyblue}直连模式: 节点 = $node_host:$node_port，WS 明文(无 TLS)。${re}"
+        echo -e "${yellow}手动配置时: 地址填机器 IP、端口 $node_port、路径 $path、传输 ws、无加密。${re}"
+    fi
+    echo -e "${white}V2rayN、NekoBox 客户端配置链接: ${re}"
+    echo -e "${skyblue}$link${re}"
+    echo ""
+    ws_selftest "$node_port" "$uuid" "$path" "$security" "$sni_val"
+    echo ""
+    press_any_key_to_continue
+}
+
+# 卸载 VLESS+WS:删掉 Xray 本体/配置/自签证书(第 4 项的清理)
+uninstall_ws() {
+    env_detect
+    svc_remove "xray" "xray"
+    rm -f /usr/local/bin/xray
+    rm -rf /usr/local/etc/xray /usr/local/share/xray
+    rm -rf /var/log/xray /var/lib/xray
+    rm -f /tmp/ws-selftest.json /tmp/xray-test.log
+    echo -e "${green}VLESS+WS 已卸载${re}"
+}
+
+# 更换 VLESS+WS 端口(回源域名场景:输入必须是 CF 代理的端口)
+change_ws_port() {
+    install_soft jq
+    ensure_netstat
+    read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回源域名场景请输入 CF 代理端口之一：443 2053 2083 2087 2096 8443，回车跳过则随机）：\033[0m' new_port
+    [[ -z "$new_port" ]] && new_port=$(rand_port)
+    while check_port "$new_port"; do
+        echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+        [[ -z "$new_port" ]] && new_port=$(rand_port)
+    done
+    if [ -f "$XRAY_CFG" ]; then
+        jq --argjson new_port "$new_port" '.inbounds[0].port = $new_port' "$XRAY_CFG" > /tmp/xray-cfg.new && mv /tmp/xray-cfg.new "$XRAY_CFG"
+        if ! "$XRAY_BIN" -test -c "$XRAY_CFG" >/tmp/xray-test.log 2>&1; then
+            echo -e "${red}错误: 改端口后配置校验失败：$(tail -1 /tmp/xray-test.log)${re}"
+            return 1
+        fi
+        restart_ws
+        echo -e "${green}端口已改为 $new_port。若走 CF，请确认它是 CF 代理端口之一并重导节点链接。${re}"
+        press_any_key_to_continue
+    else
+        echo -e "${red}未检测到 VLESS+WS 配置（$XRAY_CFG 不存在）${re}"
+        press_any_key_to_continue
+    fi
+}
+
+restart_ws() {
+    svc_restart "xray" "xray"
 }
 
 restart_reality() {
@@ -1058,9 +1417,9 @@ install_hysteria_core() {
         return 1
     fi
     tmp=$(mktemp -d) || return 1
-    echo -e "${yellow}正在下载官方 Hysteria ($asset)...${re}"
-    if ! download_official "https://github.com/apernet/hysteria/releases/latest/download/$asset" "apernet/hysteria" "$asset" "$tmp/hysteria"; then
-        echo -e "${red}错误: 下载 Hysteria 失败，请检查网络${re}"
+    echo -e "${yellow}正在安装 Hysteria ${VENDOR_HY_TAG} ($asset)，来自本项目 vendor${re}"
+    if ! vendor_fetch "hysteria/$VENDOR_HY_TAG/$asset" "$tmp/hysteria"; then
+        echo -e "${red}错误: 下载 Hysteria 失败${re}"
         rm -rf "$tmp"; return 1
     fi
     install -m 755 "$tmp/hysteria" "$HY_BIN" || { rm -rf "$tmp"; return 1; }
@@ -1283,12 +1642,11 @@ install_tuic_core() {
         return 0
     fi
     local ver tmp arch ok=0
-    ver=$(http_get "https://api.github.com/repos/EAimTY/tuic/releases/latest" 20 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    [ -z "$ver" ] && ver="tuic-server-1.0.0"
+    ver="$VENDOR_TUIC_TAG"
     tmp=$(mktemp -d) || return 1
     for arch in $(tuic_arch_candidates); do
-        echo -e "${yellow}正在下载官方 Tuic ($ver-$arch)...${re}"
-        if download_official "https://github.com/EAimTY/tuic/releases/download/$ver/$ver-$arch" "EAimTY/tuic" "$ver-$arch" "$tmp/tuic-server"; then
+        echo -e "${yellow}正在安装 Tuic ${ver} ($arch)，来自本项目 vendor${re}"
+        if vendor_fetch "tuic/$ver/$ver-$arch" "$tmp/tuic-server"; then
             chmod 755 "$tmp/tuic-server"
             if "$tmp/tuic-server" -v >/dev/null 2>&1; then
                 ok=1
@@ -1556,7 +1914,7 @@ while true; do
     echo -e "${purple}▶ 节点搭建脚本合集${re}"
     echo -e "${green}---------------------------------------------------------${re}"
     echo -e "${white} 1. Hysteria2一键脚本        2. Reality一键脚本${re}"
-    echo -e "${white} 3. Tuic-V5一键脚本${re}"
+    echo -e "${white} 3. Tuic-V5一键脚本          4. VLESS+WS一键脚本${re}"
     echo -e "${yellow}---------------------------------------------------------${re}"
     echo -e "$(env_line)"
     echo -e "${skyblue} 0. 退出脚本${re}"
@@ -1819,6 +2177,70 @@ while true; do
                         ;;
                     3)
                         uninstall_tuic
+                        break
+                        ;;
+                    0)
+                        break
+                        ;;
+                    *)
+                        echo -e "${red}无效的输入!${re}"
+                        sleep 1
+                        ;;
+                esac
+            done
+            ;;
+        4) # VLESS+WS 子菜单
+            while true; do
+                clear
+                echo "--------------"
+                echo -e "${green}1. 安装 VLESS+WS${re}"
+                echo -e "${yellow}2. 更换 VLESS+WS 端口${re}"
+                echo -e "${red}3. 卸载 VLESS+WS${re}"
+                echo "--------------"
+                echo -e "${skyblue}0. 返回上一级菜单${re}"
+                echo "--------------"
+                read -p $'\033[1;91m请输入你的选择: \033[0m' ws_sub_choice
+                case $ws_sub_choice in
+                    1)
+                        # 端口
+                        read -p $'\033[1;35m请输入 VLESS+WS 端口 (回源域名场景请输入 CF 代理端口之一: 443/2053/2083/2087/2096/8443; 回车跳过则自动): \033[0m' ws_port
+                        # 回源域名
+                        read -p $'\033[1;35m请输入回源域名 (用 Cloudflare CDN 加速就填,不填则输出机器 IP+端口直连): \033[0m' ws_origin
+                        # 回源域名模式:若用户输入非 CF 端口,自动选 CF 端口输出
+                        if [ -n "$ws_origin" ]; then
+                            # 先保证源站监听端口 = 输出端口(CF 1:1 回源);自动选 CF 端口
+                            if [ -n "$ws_port" ]; then
+                                case "$ws_port" in
+                                    443|2053|2083|2087|2096|8443) ;;
+                                    *)
+                                        echo -e "${yellow}端口 $ws_port 不在 CF 代理的 HTTPS 端口列表里,已自动改为 443。${re}"
+                                        ws_port=443 ;;
+                                esac
+                            else
+                                ws_port=443
+                                echo -e "${yellow}未输入端口,回源域名模式默认 443。${re}"
+                            fi
+                        else
+                            # 直连模式:空输入给随机端口
+                            if [ -z "$ws_port" ]; then
+                                ws_port=$(rand_port)
+                                echo -e "${yellow}未输入端口,已为您分配随机端口: $ws_port${re}"
+                            fi
+                            while check_port "$ws_port"; do
+                                echo -e "${red}${ws_port}端口已经被其他程序占用,请更换端口重试${re}"
+                                read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
+                                [ -z "$ws_port" ] && ws_port=$(rand_port)
+                            done
+                        fi
+                        install_ws "$ws_port" "$ws_origin"
+                        break
+                        ;;
+                    2)
+                        change_ws_port
+                        break
+                        ;;
+                    3)
+                        uninstall_ws
                         break
                         ;;
                     0)
