@@ -740,19 +740,54 @@ get_public_ip() {
     printf '%s' "$ip"
 }
 
-# 节点显示名（取不到就给个占位，绝不输出空标签）
+# 节点显示名：国家-城市，取不到就回退 node，绝不输出空标签。
+# 旧数据源 speed.cloudflare.com/meta 已 403。数据源按顺序：ipinfo.io -> ip.sb -> ip-api.com。
+# 全部 busybox 兼容：jq 或 awk 解析。
+fetch_geo_json() { # $1=url
+    has curl || return 1
+    curl -s --max-time 8 "$1" 2>/dev/null
+}
+
+geo_pick() { # $1=json $2=jq表达式 $3=awk字段名
+    local json=$1 expr=$2 key=$3 out=""
+    [ -z "$json" ] && return 1
+    if has jq; then
+        out=$(printf '%s' "$json" | jq -r "$expr" 2>/dev/null)
+    fi
+    if [ -z "$out" ] || [ "$out" = "null" ]; then
+        out=$(printf '%s' "$json" | tr ',' '\n' | awk -F'"' -v k="$key" '$2==k{print $4; exit}')
+    fi
+    case "$out" in ""|null) return 1 ;; esac
+    printf '%s' "$out"
+}
+
 get_isp_name() {
-    local meta txt=""
-    meta=$(curl -s --max-time 6 https://speed.cloudflare.com/meta 2>/dev/null)
-    if [ -n "$meta" ] && command -v jq >/dev/null 2>&1; then
-        txt=$(printf '%s' "$meta" | jq -r '((.country // "") + "-" + (.asOrganization // ""))' 2>/dev/null)
+    local meta c="" i="" txt=""
+    # 源1 ipinfo.io：country / city
+    meta=$(fetch_geo_json "https://ipinfo.io/json")
+    c=$(geo_pick "$meta" '.country' 'country')
+    i=$(geo_pick "$meta" '.city' 'city')
+    # 源2 ip.sb：country_code / city
+    if [ -z "$c" ]; then
+        meta=$(fetch_geo_json "https://api.ip.sb/geoip")
+        c=$(geo_pick "$meta" '.country_code' 'country_code')
+        i=$(geo_pick "$meta" '.city' 'city')
     fi
-    case "$txt" in ""|"-"|"null-null") txt="" ;; esac
-    if [ -z "$txt" ]; then
-        txt=$(printf '%s' "$meta" | tr ',' '\n' | awk -F'"' '/country/{c=$4} /asOrganization/{i=$4} END{if(c!=""||i!="")print c"-"i}')
+    # 源3 ip-api.com：countryCode / city。免费计划 https 返回 {"status":"fail"}，
+    # geo_pick 解析不出国家码时继续试 http 版
+    if [ -z "$c" ]; then
+        meta=$(fetch_geo_json "https://ip-api.com/json/?fields=status,countryCode,city")
+        c=$(geo_pick "$meta" '.countryCode' 'countryCode')
+        if [ -z "$c" ]; then
+            meta=$(fetch_geo_json "http://ip-api.com/json/?fields=status,countryCode,city")
+            c=$(geo_pick "$meta" '.countryCode' 'countryCode')
+        fi
+        i=$(geo_pick "$meta" '.city' 'city')
     fi
+    [ -n "$c" ] && txt="$c"
+    [ -n "$c" ] && [ -n "$i" ] && txt="$c-$i"
     [ -z "$txt" ] && txt="node"
-    printf '%s' "$txt" | tr ' ' '_' | tr -d '"'
+    printf '%s' "$txt" | tr ' ' '_' | tr -d '"#'
 }
 
 # 安装官方静态 Xray（Go 静态构建，musl 上可直接运行）
@@ -881,7 +916,7 @@ reality_build_link() {
     [ -z "$pub" ] && return 1
     [ -z "$sid" ] || [ "$sid" = "null" ] && sid=""
     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
-        "$uuid" "$host" "$port" "$sni" "$pub" "$sid" "$isp"
+        "$uuid" "$host" "$port" "$sni" "$pub" "$sid" "$isp-Reality"
     return 0
 }
 
@@ -969,7 +1004,10 @@ ws_write_config() {
     local port=$1 ws_host=$2 uuid=$3 path=$4 security=$5 sni=$6
     local tls_block=""
     if [ "$security" = "tls" ]; then
+        # alpn 显式 http/1.1：WS 必须走 HTTP/1.1；CF 回源握手会带 ALPN 请求，
+        # 源端不声明时协商结果为空（No ALPN negotiated），显式声明更稳。
         tls_block="\"tlsSettings\": {
+                    \"alpn\": [\"http/1.1\"],
                     \"certificates\": [
                         {
                             \"certificateFile\": \"$XRAY_CFG_DIR/cert.pem\",
@@ -1021,28 +1059,10 @@ EOF
     return 0
 }
 
-# CF 只代理这 6 个 HTTPS 端口,回源域名场景的节点端口只能从这里面选
-CF_PORTS=(443 2053 2083 2087 2096 8443)
-
-# 从 CF 端口里挑一个本机没被占用的;用户输入若是 CF 端口且空闲则优先。纯函数:只打印端口。
-cf_pick_port() { # $1=用户输入端口(可为空)
-    local input=$1 p
-    if [ -n "$input" ]; then
-        for p in "${CF_PORTS[@]}"; do
-            if [ "$input" = "$p" ] && ! check_port "$p"; then
-                echo "$input"
-                return 0
-            fi
-        done
-    fi
-    for p in "${CF_PORTS[@]}"; do
-        if ! check_port "$p"; then
-            echo "$p"
-            return 0
-        fi
-    done
-    echo "443"
-}
+# CF 边缘接受的访客端口（HTTPS）。客户端连 CF 只能用这里面之一；
+# 但 CF → 源站的端口由 Origin Rules 的「Destination port」改写，1-65535 任意，
+# 所以源站监听端口不受这个列表限制。本脚本节点链接固定输出 443（最通用）。
+CF_EDGE_PORTS="443 2053 2083 2087 2096 8443"
 
 # 自测用 127.0.0.1 连自己,先验证服务端 TLS/WS/路径可用,与 CF 是否配好无关。
 ws_selftest() { # $1=port $2=uuid $3=path $4=security $5=ServerName/Host(可空)
@@ -1172,17 +1192,18 @@ install_ws() {
     [ -z "$uuid" ] && uuid=$(rand_uuid)
     path="/$(rand_token)"
 
-    # 双模式:
-    #   填回源域名 -> 走 CF:端口必须是 CF 代理的 6 个 HTTPS 端口,源站 TLS(自签证书,CF Full 模式可回源)
-    #   不填       -> 直连:任意端口,WS 明文(security=none),不需要证书
-    local security ws_host_hdr sni_val
+    # 双模式（端口语义要分清）：
+    #   不填回源域名 -> 直连：源站监听 $port，节点输出 机器IP:$port，WS 明文
+    #   填回源域名   -> CF 回源：源站仍监听 $port（你填多少就是多少，CF 用 Origin Rules
+    #                  把访客端口改写到 $port，支持 1-65535 任意端口），节点输出 域名:443
+    #                  （443 是访客连 CF 的端口；想换 CF 边缘端口可以手动改）
+    # 源站走 TLS(自签证书)，因为 CF 回源必须是 HTTPS。
+    local security ws_host sni_val edge_port
     if [ -n "$origin_host" ]; then
         security="tls"
-        node_port=$(cf_pick_port "$port")
-        if [ -n "$port" ] && [ "$port" != "$node_port" ]; then
-            echo -e "${yellow}端口 $port 无法用于 CF 回源(不在代理端口列表或已被占用)，已自动改用 $node_port。${re}"
-        fi
-        ws_host_hdr="$origin_host"
+        node_port=$port          # 源站监听端口 = 用户输入，不改写
+        edge_port="443"          # 客户端连 CF 边缘的端口
+        ws_host="$origin_host"
         sni_val="$origin_host"
         mkdir -p "$XRAY_CFG_DIR"
         if ! openssl ecparam -name prime256v1 -genkey -noout -out "$XRAY_CFG_DIR/key.pem" 2>/dev/null \
@@ -1196,11 +1217,12 @@ install_ws() {
     else
         security="none"
         node_port=$port
-        ws_host_hdr="$port"
+        edge_port=$port
+        ws_host="localhost"
         sni_val=""
     fi
 
-    if ! ws_write_config "$node_port" "$( [ -n "$origin_host" ] && echo "$origin_host" || echo "localhost" )" "$uuid" "$path" "$security" "$sni_val"; then
+    if ! ws_write_config "$node_port" "$ws_host" "$uuid" "$path" "$security" "$sni_val"; then
         press_any_key_to_continue
         return 1
     fi
@@ -1211,10 +1233,11 @@ install_ws() {
     host=$(get_public_ip)
     isp=$(get_isp_name)
 
-    # 节点地址:填了回源域名就用域名,否则用机器 IP
+    # 节点地址:填了回源域名就输出「域名:443」(客户端连 CF 的边缘端口)，
+    # 源站实际监听 $node_port，两者靠 CF 的 Origin Rule 端口改写连起来。
     if [ -n "$origin_host" ]; then
         node_host="$origin_host"
-        link="vless://$uuid@$node_host:$node_port?encryption=none&security=tls&type=ws&sni=$sni_val&fp=chrome&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
+        link="vless://$uuid@$node_host:$edge_port?encryption=none&security=tls&type=ws&sni=$sni_val&fp=chrome&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
     else
         node_host="$host"
         link="vless://$uuid@$node_host:$node_port?encryption=none&security=none&type=ws&host=$node_host&path=$path#$isp-VLESS+WS"
@@ -1229,12 +1252,14 @@ install_ws() {
         echo -e "${yellow}请把下面链接里的主机名手动改成你的公网地址再导入客户端。${re}"
     fi
     if [ -n "$origin_host" ]; then
-        echo -e "${skyblue}回源域名模式: 节点 = $origin_host:$node_port(CF 代理的 HTTPS 端口，443/2053/2083/2087/2096/8443 中本机空闲的第一个）。${re}"
-        echo -e "${yellow}用之前请确认: ${re}"
-        echo -e "${yellow}  1) $origin_host 已托管在 Cloudflare 且 DNS 点亮橙色云朵(Proxied)。${re}"
-        echo -e "${yellow}  2) Cloudflare SSL/TLS 模式设为 Full(自签证书可)；Full(strict) 需换成 CF Origin CA 证书。${re}"
-        echo -e "${yellow}  3) 本机防火墙放行 $node_port。CF 按“访客端口 → 源站同端口”1:1 回源。${re}"
-        echo -e "${yellow}客户端手动配置时: 地址填 CF 优选IP、端口 $node_port、SNI/Host 填 $origin_host、路径 $path、传输 ws、TLS。${re}"
+        echo -e "${skyblue}源站监听: 0.0.0.0:$node_port (TLS)${re}"
+        echo -e "${skyblue}节点输出: $origin_host:$edge_port (客户端连 CF 边缘，CF 按你的回源规则转到 $node_port)${re}"
+        echo -e "${yellow}CF 侧需要确认: ${re}"
+        echo -e "${yellow}  1) $origin_host 已托管在 Cloudflare，DNS 点亮橙色云朵(Proxied)。${re}"
+        echo -e "${yellow}  2) Cloudflare SSL/TLS 设为 Full(自签证书可)；Full(strict) 需换 CF Origin CA 证书。${re}"
+        echo -e "${yellow}  3) 本机防火墙放行 $node_port。${re}"
+        echo -e "${yellow}  4) CF 的回源目标端口要对应 $node_port(你已配好则跳过)。${re}"
+        echo -e "${yellow}客户端手动配置: 地址填 CF 优选IP、端口 $edge_port、SNI 和 Host 填 $origin_host、路径 $path、传输 ws、TLS。${re}"
     else
         echo -e "${skyblue}直连模式: 节点 = $node_host:$node_port，WS 明文(无 TLS)。${re}"
         echo -e "${yellow}手动配置时: 地址填机器 IP、端口 $node_port、路径 $path、传输 ws、无加密。${re}"
@@ -1258,30 +1283,48 @@ uninstall_ws() {
     echo -e "${green}VLESS+WS 已卸载${re}"
 }
 
-# 更换 VLESS+WS 端口(回源域名场景:输入必须是 CF 代理的端口)
+# 更换 VLESS+WS 端口（改的是源站监听端口；CF 模式下节点链接里的端口不变）
 change_ws_port() {
     install_soft jq
     ensure_netstat
-    read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回源域名场景请输入 CF 代理端口之一：443 2053 2083 2087 2096 8443，回车跳过则随机）：\033[0m' new_port
+    read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（源站监听端口；走 CF 的话改完记得把 Origin Rule 的 Destination port 同步成它，回车跳过则随机）：\033[0m' new_port
     [[ -z "$new_port" ]] && new_port=$(rand_port)
     while check_port "$new_port"; do
         echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
         read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回车跳过则随机）：\033[0m' new_port
         [[ -z "$new_port" ]] && new_port=$(rand_port)
     done
-    if [ -f "$XRAY_CFG" ]; then
-        jq --argjson new_port "$new_port" '.inbounds[0].port = $new_port' "$XRAY_CFG" > /tmp/xray-cfg.new && mv /tmp/xray-cfg.new "$XRAY_CFG"
-        if ! "$XRAY_BIN" -test -c "$XRAY_CFG" >/tmp/xray-test.log 2>&1; then
-            echo -e "${red}错误: 改端口后配置校验失败：$(tail -1 /tmp/xray-test.log)${re}"
-            return 1
-        fi
-        restart_ws
-        echo -e "${green}端口已改为 $new_port。若走 CF，请确认它是 CF 代理端口之一并重导节点链接。${re}"
-        press_any_key_to_continue
-    else
+    if [ ! -f "$XRAY_CFG" ]; then
         echo -e "${red}未检测到 VLESS+WS 配置（$XRAY_CFG 不存在）${re}"
         press_any_key_to_continue
+        return 0
     fi
+    local sec
+    sec=$(jq -r '.inbounds[0].streamSettings.security' "$XRAY_CFG" 2>/dev/null)
+    jq --argjson new_port "$new_port" '.inbounds[0].port = $new_port' "$XRAY_CFG" > /tmp/xray-cfg.new && mv /tmp/xray-cfg.new "$XRAY_CFG"
+    if ! "$XRAY_BIN" -test -c "$XRAY_CFG" >/tmp/xray-test.log 2>&1; then
+        echo -e "${red}错误: 改端口后配置校验失败：$(tail -1 /tmp/xray-test.log)${re}"
+        return 1
+    fi
+    restart_ws
+    echo -e "${green}源站监听端口已改为 $new_port${re}"
+    if [ "$sec" = "tls" ]; then
+        # CF 模式：客户端连的是 CF 边缘端口，链接不变；变的是 CF→源站的回源端口
+        echo -e "${yellow}该节点走 CF 回源，客户端链接无需改动，但必须去 Cloudflare 同步：${re}"
+        echo -e "${yellow}  Origin Rules → 匹配 $new_port 对应的那条规则 → Destination port 改成 $new_port${re}"
+        echo -e "${yellow}  同时确认本机防火墙已放行 $new_port${re}"
+    else
+        # 直连模式：链接里的端口就是源站端口，同步重写 link.txt
+        local old_port
+        old_port=$(grep -oE '@[^:@]+:[0-9]+' "$XRAY_LINK" 2>/dev/null | head -1)
+        if [ -n "$old_port" ] && [ -f "$XRAY_LINK" ]; then
+            sed -i "s|$old_port|@${old_port#@}|; s|:${old_port##*:}|:$new_port|" "$XRAY_LINK"
+        fi
+        echo -e "${skyblue}直连节点，链接里的端口已同步为新端口。${re}"
+        echo -e "${white}新链接: ${re}$(cat "$XRAY_LINK" 2>/dev/null)"
+        echo -e "${yellow}确认本机防火墙放行 $new_port${re}"
+    fi
+    press_any_key_to_continue
 }
 
 restart_ws() {
@@ -1323,7 +1366,7 @@ install_reality() {
 
     host=$(get_public_ip)
     isp=$(get_isp_name)
-    link="vless://$uuid@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$RE_PUB&sid=$sid&type=tcp&headerType=none#$isp"
+    link="vless://$uuid@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$RE_PUB&sid=$sid&type=tcp&headerType=none#$isp-Reality"
     printf '%s\n' "$link" > "$XRAY_LINK"
 
     echo ""
@@ -1496,7 +1539,7 @@ EOF
     if [ -z "$link" ]; then
         link="hysteria2://$pass@$host:$port/?sni=www.bing.com&alpn=h3&insecure=1"
     fi
-    printf '%s#%s' "$link" "$isp"
+    printf '%s#%s' "$link" "$isp-Hysteria2"
     return 0
 }
 
@@ -1594,7 +1637,7 @@ install_hysteria() {
     isp=$(get_isp_name)
     link=$(hy_build_link "$port" "$pass")
     if [ -z "$link" ]; then
-        link="hysteria2://$pass@$host:$port/?sni=www.bing.com&alpn=h3&insecure=1#$isp"
+        link="hysteria2://$pass@$host:$port/?sni=www.bing.com&alpn=h3&insecure=1#$isp-Hysteria2"
     fi
     printf '%s\n' "$link" > "$HY_LINK"
 
@@ -1704,7 +1747,7 @@ tuic_build_link() {
     [ -z "$host" ] && return 1
     isp=$(get_isp_name)
     printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&alpn=h3&sni=www.bing.com&udp_relay_mode=native&allow_insecure=1#%s' \
-        "$uuid" "$pass" "$host" "$3" "$isp"
+        "$uuid" "$pass" "$host" "$3" "$isp-Tuic"
     return 0
 }
 
@@ -2202,36 +2245,20 @@ while true; do
                 read -p $'\033[1;91m请输入你的选择: \033[0m' ws_sub_choice
                 case $ws_sub_choice in
                     1)
-                        # 端口
-                        read -p $'\033[1;35m请输入 VLESS+WS 端口 (回源域名场景请输入 CF 代理端口之一: 443/2053/2083/2087/2096/8443; 回车跳过则自动): \033[0m' ws_port
+                        # 端口 = 源站监听端口，任意 1-65535，不因回源域名而改写
+                        read -p $'\033[1;35m请输入 VLESS+WS 端口[1-65535] (回车跳过则随机；这个端口是源站监听端口): \033[0m' ws_port
                         # 回源域名
                         read -p $'\033[1;35m请输入回源域名 (用 Cloudflare CDN 加速就填,不填则输出机器 IP+端口直连): \033[0m' ws_origin
-                        # 回源域名模式:若用户输入非 CF 端口,自动选 CF 端口输出
-                        if [ -n "$ws_origin" ]; then
-                            # 先保证源站监听端口 = 输出端口(CF 1:1 回源);自动选 CF 端口
-                            if [ -n "$ws_port" ]; then
-                                case "$ws_port" in
-                                    443|2053|2083|2087|2096|8443) ;;
-                                    *)
-                                        echo -e "${yellow}端口 $ws_port 不在 CF 代理的 HTTPS 端口列表里,已自动改为 443。${re}"
-                                        ws_port=443 ;;
-                                esac
-                            else
-                                ws_port=443
-                                echo -e "${yellow}未输入端口,回源域名模式默认 443。${re}"
-                            fi
-                        else
-                            # 直连模式:空输入给随机端口
-                            if [ -z "$ws_port" ]; then
-                                ws_port=$(rand_port)
-                                echo -e "${yellow}未输入端口,已为您分配随机端口: $ws_port${re}"
-                            fi
-                            while check_port "$ws_port"; do
-                                echo -e "${red}${ws_port}端口已经被其他程序占用,请更换端口重试${re}"
-                                read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
-                                [ -z "$ws_port" ] && ws_port=$(rand_port)
-                            done
+                        # 源站端口：空输入给随机端口，被占用则要求重填。两种模式都一样，不改写。
+                        if [ -z "$ws_port" ]; then
+                            ws_port=$(rand_port)
+                            echo -e "${yellow}未输入端口,已为您分配随机端口: $ws_port${re}"
                         fi
+                        while check_port "$ws_port"; do
+                            echo -e "${red}${ws_port}端口已经被其他程序占用,请更换端口重试${re}"
+                            read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
+                            [ -z "$ws_port" ] && ws_port=$(rand_port)
+                        done
                         install_ws "$ws_port" "$ws_origin"
                         break
                         ;;
