@@ -317,6 +317,11 @@ VENDOR_XRAY_TAG="v26.3.27"
 VENDOR_HY_TAG="app-v2.13.0"
 VENDOR_TUIC_TAG="tuic-server-1.0.0"
 
+# CF 优选域名：客户端连它（解析到线路好的 CF 边缘 IP），
+# 但 SNI / Host 仍然填你的回源域名，CF 靠这两个认出你的站点。
+# 该域名解析出来的 IP 会随优选结果变化，所以用域名而不是写死 IP。
+CF_PREFER_DOMAIN="${CF_PREFER_DOMAIN:-cf.witcorn.eu.org}"
+
 http_fetch() { # $1=url $2=输出文件
     if has curl; then
         curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 -o "$2" "$1"
@@ -715,7 +720,19 @@ xray_asset() {
     esac
 }
 
+# 判断是不是 WARP 的地址。WARP 的 IPv6 落在 2a09:bac5::/32（Cloudflare WARP 专用段），
+# 正常 CF 边缘 IPv6 是 2606:4700::/32。这两个前缀不能混。
+# WARP 地址不是机器真实所在地，节点名里用它的地区是错的，必须排除。
+is_warp_ip() { # $1=ip
+    case "$1" in
+        2a09:bac5:*|2a09:bac4:*) return 0 ;;
+        2606:4700:110:*|2606:4700:120:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 公网 IP：IPv4 -> IPv6(自动加方括号) -> 网卡。busybox 兼容，不用 grep -oP
+# WARP 的地址一律丢弃：它不代表机器真实地区，节点名会算错。
 get_public_ip() {
     local ip=""
     ip=$(curl -s --max-time 5 https://ipv4.ip.sb 2>/dev/null | tr -d '[:space:]')
@@ -727,12 +744,20 @@ get_public_ip() {
             *)   ip="" ;;
         esac
     fi
+    # IPv6 拿到的是 WARP 地址就丢掉，不能用
+    if [ -n "$ip" ] && is_warp_ip "$ip"; then
+        ip=""
+    fi
     if [ -z "$ip" ]; then
         ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
     fi
     if [ -z "$ip" ]; then
         ip=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
         case "$ip" in *:*) ip="[$ip]" ;; *) ip="" ;; esac
+        # 路由源地址也可能是 WARP 的
+        if [ -n "$ip" ] && is_warp_ip "$ip"; then
+            ip=""
+        fi
     fi
     if [ -z "$ip" ]; then
         ip=$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -1)
@@ -1167,9 +1192,9 @@ install_reality_service() {
 }
 
 # 一键安装 VLESS+WS(第 4 项)
-# $1=端口 $2=回源域名(空=直连机器 IP)
+# $1=端口 $2=回源域名(空=直连机器 IP) $3=回源加密方式(full=Full/flexible=Flexible, 空=full)
 install_ws() {
-    local port=$1 origin_host=$2 uuid path host isp node_host node_port link
+    local port=$1 origin_host=$2 origin_mode=${3:-full} uuid path host isp node_host node_port link
     install_soft curl
     install_soft jq
     install_soft openssl
@@ -1192,27 +1217,32 @@ install_ws() {
     [ -z "$uuid" ] && uuid=$(rand_uuid)
     path="/$(rand_token)"
 
-    # 双模式（端口语义要分清）：
-    #   不填回源域名 -> 直连：源站监听 $port，节点输出 机器IP:$port，WS 明文
-    #   填回源域名   -> CF 回源：源站仍监听 $port（你填多少就是多少，CF 用 Origin Rules
-    #                  把访客端口改写到 $port，支持 1-65535 任意端口），节点输出 域名:443
-    #                  （443 是访客连 CF 的端口；想换 CF 边缘端口可以手动改）
-    # 源站走 TLS(自签证书)，因为 CF 回源必须是 HTTPS。
+    # 三种组合（端口语义要分清）：
+    #   不填回源域名 -> 直连：源站监听 $port，节点输出 机器IP:$port，WS 明文，无证书
+    #   填域名+full  -> CF Full：源站监听 $port 且跑 TLS(自签证书)，节点输出 域名:443
+    #   填域名+flex  -> CF Flexible：CF 回源走明文 HTTP，源站监听 $port 跑明文 WS，
+    #                   节点输出 域名:443，源站不需要证书
+    # 源站监听端口始终 = 用户输入的端口，绝不改写；CF 回源到哪个端口由用户的 Origin Rule 决定。
     local security ws_host sni_val edge_port
     if [ -n "$origin_host" ]; then
-        security="tls"
         node_port=$port          # 源站监听端口 = 用户输入，不改写
         edge_port="443"          # 客户端连 CF 边缘的端口
         ws_host="$origin_host"
-        sni_val="$origin_host"
-        mkdir -p "$XRAY_CFG_DIR"
-        if ! openssl ecparam -name prime256v1 -genkey -noout -out "$XRAY_CFG_DIR/key.pem" 2>/dev/null \
-            || ! openssl req -new -x509 -nodes -days 3650 -subj "/CN=$origin_host" \
-                -key "$XRAY_CFG_DIR/key.pem" -out "$XRAY_CFG_DIR/cert.pem" 2>/dev/null; then
-            echo -e "${red}错误: 自签证书生成失败（需要 openssl）。${re}"
-            echo -e "${yellow}请手动放一对证书到 $XRAY_CFG_DIR/cert.pem 和 key.pem 再重装。${re}"
-            press_any_key_to_continue
-            return 1
+        if [ "$origin_mode" = "flexible" ]; then
+            security="none"      # CF 回源明文 HTTP，源站不需要 TLS
+            sni_val=""
+        else
+            security="tls"       # CF Full 回源 TLS，源站用自签证书
+            sni_val="$origin_host"
+            mkdir -p "$XRAY_CFG_DIR"
+            if ! openssl ecparam -name prime256v1 -genkey -noout -out "$XRAY_CFG_DIR/key.pem" 2>/dev/null \
+                || ! openssl req -new -x509 -nodes -days 3650 -subj "/CN=$origin_host" \
+                    -key "$XRAY_CFG_DIR/key.pem" -out "$XRAY_CFG_DIR/cert.pem" 2>/dev/null; then
+                echo -e "${red}错误: 自签证书生成失败（需要 openssl）。${re}"
+                echo -e "${yellow}请手动放一对证书到 $XRAY_CFG_DIR/cert.pem 和 key.pem 再重装。${re}"
+                press_any_key_to_continue
+                return 1
+            fi
         fi
     else
         security="none"
@@ -1233,11 +1263,16 @@ install_ws() {
     host=$(get_public_ip)
     isp=$(get_isp_name)
 
-    # 节点地址:填了回源域名就输出「域名:443」(客户端连 CF 的边缘端口)，
-    # 源站实际监听 $node_port，两者靠 CF 的 Origin Rule 端口改写连起来。
+    # 节点地址:填了回源域名就输出「优选域名:443」——
+    # 客户端连 CF 优选边缘(提速)，SNI/Host 仍填你的回源域名(CF 靠它认站点)。
+    # 源站实际监听 $node_port，CF 按你的 Origin Rule 转到那里。
     if [ -n "$origin_host" ]; then
-        node_host="$origin_host"
-        link="vless://$uuid@$node_host:$edge_port?encryption=none&security=tls&type=ws&sni=$sni_val&fp=chrome&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
+        node_host="$CF_PREFER_DOMAIN"
+        if [ "$security" = "tls" ]; then
+            link="vless://$uuid@$node_host:$edge_port?encryption=none&security=tls&type=ws&sni=$sni_val&fp=chrome&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
+        else
+            link="vless://$uuid@$node_host:$edge_port?encryption=none&security=none&type=ws&host=$origin_host&path=$path#$isp-VLESS+WS-CF"
+        fi
     else
         node_host="$host"
         link="vless://$uuid@$node_host:$node_port?encryption=none&security=none&type=ws&host=$node_host&path=$path#$isp-VLESS+WS"
@@ -1252,14 +1287,31 @@ install_ws() {
         echo -e "${yellow}请把下面链接里的主机名手动改成你的公网地址再导入客户端。${re}"
     fi
     if [ -n "$origin_host" ]; then
-        echo -e "${skyblue}源站监听: 0.0.0.0:$node_port (TLS)${re}"
-        echo -e "${skyblue}节点输出: $origin_host:$edge_port (客户端连 CF 边缘，CF 按你的回源规则转到 $node_port)${re}"
+        if [ "$security" = "tls" ]; then
+            echo -e "${skyblue}源站监听: 0.0.0.0:$node_port (TLS，自签证书)${re}"
+        else
+            echo -e "${skyblue}源站监听: 0.0.0.0:$node_port (明文 HTTP，无 TLS)${re}"
+        fi
+        echo -e "${skyblue}节点输出: $node_host:$edge_port (连 CF 优选边缘)${re}"
+        echo -e "${skyblue}  SNI/Host: $origin_host (CF 靠这个认出你的站点)${re}"
+        echo -e "${skyblue}源站监听: 你的机器 $node_port 端口${re}"
         echo -e "${yellow}CF 侧需要确认: ${re}"
         echo -e "${yellow}  1) $origin_host 已托管在 Cloudflare，DNS 点亮橙色云朵(Proxied)。${re}"
-        echo -e "${yellow}  2) Cloudflare SSL/TLS 设为 Full(自签证书可)；Full(strict) 需换 CF Origin CA 证书。${re}"
+        if [ "$security" = "tls" ]; then
+            echo -e "${yellow}  2) SSL/TLS 加密模式设 Full 或 Full(strict)（源站已有 TLS，两种都能用）。${re}"
+            echo -e "${yellow}     Full 不校验源站证书，自签即可，最省事。${re}"
+            echo -e "${yellow}     Full(strict) 会校验证书，需换 CF Origin CA 或公网证书。${re}"
+        else
+            echo -e "${yellow}  2) SSL/TLS 加密模式设 Flexible（CF 回源走明文 HTTP，源站不需要证书）。${re}"
+            echo -e "${yellow}     注意：Flexible 下 CF→源站这一跳是明文，源站 IP 暴露的那段链路可被窥探。${re}"
+        fi
         echo -e "${yellow}  3) 本机防火墙放行 $node_port。${re}"
         echo -e "${yellow}  4) CF 的回源目标端口要对应 $node_port(你已配好则跳过)。${re}"
-        echo -e "${yellow}客户端手动配置: 地址填 CF 优选IP、端口 $edge_port、SNI 和 Host 填 $origin_host、路径 $path、传输 ws、TLS。${re}"
+        if [ "$security" = "tls" ]; then
+            echo -e "${yellow}客户端手动配置: 地址填 CF 优选IP、端口 $edge_port、SNI 和 Host 填 $origin_host、路径 $path、传输 ws、TLS。${re}"
+        else
+            echo -e "${yellow}客户端手动配置: 地址填 CF 优选IP、端口 $edge_port、Host 填 $origin_host、路径 $path、传输 ws、无 TLS。${re}"
+        fi
     else
         echo -e "${skyblue}直连模式: 节点 = $node_host:$node_port，WS 明文(无 TLS)。${re}"
         echo -e "${yellow}手动配置时: 地址填机器 IP、端口 $node_port、路径 $path、传输 ws、无加密。${re}"
@@ -2259,7 +2311,21 @@ while true; do
                             read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
                             [ -z "$ws_port" ] && ws_port=$(rand_port)
                         done
-                        install_ws "$ws_port" "$ws_origin"
+                        # 回源加密方式：只对填了回源域名的才有意义
+                        ws_mode="full"
+                        if [ -n "$ws_origin" ]; then
+                            read -p $'\033[1;35m源站是否启用 TLS（Cloudflare SSL 模式设 Full）? (Y/n 回车=Yes): \033[0m' ws_tls_ans
+                            case "$ws_tls_ans" in
+                                [Nn]*|"no"*|"NO"*) ws_mode="flexible" ;;
+                                *) ws_mode="full" ;;
+                            esac
+                            if [ "$ws_mode" = "full" ]; then
+                                echo -e "${green}已选择 Full：源站启用 TLS(自签证书)，CF 的 SSL/TLS 模式设 Full 或 Full(strict)。${re}"
+                            else
+                                echo -e "${green}已选择 Flexible：源站跑明文(无证书)，CF 的 SSL/TLS 模式设 Flexible。${re}"
+                            fi
+                        fi
+                        install_ws "$ws_port" "$ws_origin" "$ws_mode"
                         break
                         ;;
                     2)
