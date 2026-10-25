@@ -123,7 +123,10 @@ sysctl_apply() { # $1=key $2=value；返回 0=本次运行已生效，1=仅持�
     local key=$1 val=$2 live=0 saved=0 conf=""
     # 1) 直接写 /proc 立即生效。
     # 不能用 [ -w ] 判断：root 对只读挂载的 /proc/sys 也显示"可写"，只有真写一次才知道
-    if printf '%s\n' "$val" > "/proc/sys/$key" 2>/dev/null; then
+    # 注意：'... > file 2>/dev/null' 管不住这个错误——shell 是先打开文件再跑命令，
+    # 打开失败(只读 /proc/sys)由 shell 自己报，绕过命令级重定向，会打出 Permission denied。
+    # 必须把整条复合命令的 stderr 一起重定向。
+    if { printf '%s\n' "$val" > "/proc/sys/$key"; } 2>/dev/null; then
         live=1
     fi
     # 2) 持久化：能写 /etc/sysctl.d 就写配置文件
@@ -320,7 +323,7 @@ VENDOR_TUIC_TAG="tuic-server-1.0.0"
 # CF 优选域名：客户端连它（解析到线路好的 CF 边缘 IP），
 # 但 SNI / Host 仍然填你的回源域名，CF 靠这两个认出你的站点。
 # 该域名解析出来的 IP 会随优选结果变化，所以用域名而不是写死 IP。
-CF_PREFER_DOMAIN="${CF_PREFER_DOMAIN:-cf.witcorn.eu.org}"
+CF_PREFER_DOMAIN="${CF_PREFER_DOMAIN:-saas.sin.fan}"
 
 http_fetch() { # $1=url $2=输出文件
     if has curl; then
