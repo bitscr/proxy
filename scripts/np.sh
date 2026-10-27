@@ -33,6 +33,27 @@ case "$SELF" in
     bash|sh|dash|-bash|-sh|"") SELF="np.sh" ;;
 esac
 
+# ============================================================================
+# 外部传参：SOCKS5 端口与面板上传地址（其它协议仍走菜单交互）
+#   写法一（环境变量，放在 bash 前面）:
+#       s5_port=23470 s5_upload='https://xxx/add?token=yyy' bash np.sh
+#   写法二（跟在脚本后面）:
+#       bash np.sh s5_port=23470 s5_upload='https://xxx/add?token=yyy'
+#   两种写法等价；命令行优先级高于环境变量；大小写均可（s5_port / S5_PORT）。
+#   传了参数就不再进菜单，直接装完退出（适合 curl|bash、批量开鸡）。
+# ============================================================================
+S5_PORT="${S5_PORT:-${s5_port:-}}"
+S5_UPLOAD="${S5_UPLOAD:-${s5_upload:-}}"
+for _arg in "$@"; do
+    case "$_arg" in
+        s5_port=*|S5_PORT=*)     S5_PORT="${_arg#*=}" ;;
+        s5_upload=*|S5_UPLOAD=*) S5_UPLOAD="${_arg#*=}" ;;
+        *=*)                     echo "忽略未知参数: ${_arg%%=*}" ;;
+        *)                       echo "忽略无法识别的参数: $_arg（用法: s5_port=端口 s5_upload=上传地址）" ;;
+    esac
+done
+unset _arg
+
 # --- 颜色定义 ---
 red='\033[0;31m'
 green='\033[0;32m'
@@ -518,8 +539,13 @@ port_listening() {
 }
 
 # 按任意键继续
+# 非交互场景（curl | bash、批量开鸡、传参直装）没有 tty，read 会挂住或报错，
+# 这时直接跳过；判断条件：标准输入不是终端，或走的是传参直装路径。
 press_any_key_to_continue() {
     echo -e "${skyblue}---------------------------------------------------------${re}"
+    if [ ! -t 0 ] || [ -n "$S5_DIRECT" ]; then
+        return 0
+    fi
     read -n 1 -s -r -p "按任意键返回上一级菜单..."
     echo ""
 }
@@ -861,6 +887,30 @@ country_flag() { # $1=两位国家码(大小写均可)  输出国旗或空
         out="$out$(printf '\\%03o\\%03o\\%03o\\%03o' "$b1" "$b2" "$b3" "$b4")"
     done
     printf '%b' "$out"
+}
+
+# 从国旗 emoji 反推两位国家码（country_flag 的逆运算）：
+# 🇺🇸 = f0 9f 87 ba f0 9f 87 b8 -> 码点 0x1F1FA/0x1F1F8 -> 'U'/'S'。
+# 用途：clash 订阅经 subconverter 转换时会先删国旗再按关键词表补回，
+# 表里有国家码(US/JP)规则但没有英文城市名，上传名里带上国家码国旗才能回来。
+flag_to_cc() { # $1=国旗emoji  输出大写国家码或空
+    local f=$1 out="" b cp i
+    f=$(printf '%s' "$f" | od -An -tx1 | tr -d ' \n')
+    # 每个旗子字符是 4 字节 UTF-8；取第一个字符的后 3 字节算码点
+    [ ${#f} -ge 16 ] || { printf ''; return 1; }
+    for i in 0 8; do
+        b=${f:$((i+2)):6}   # 跳过 F0/F1 首字节，取后 3 字节的 hex
+        cp=$(( 0x$(printf '%s' "${b:0:2}") & 0x3F )); cp=$(( cp * 64 ))
+        cp=$(( cp + (0x$(printf '%s' "${b:2:2}") & 0x3F) )); cp=$(( cp * 64 ))
+        cp=$(( cp + (0x$(printf '%s' "${b:4:2}") & 0x3F) ))
+        # 0x41='A'，0x1F1E6+'A' 起算
+        cp=$(( cp - 0x1F1E6 ))
+        case $(( cp + 0 )) in
+            0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25) out="$out$(printf \\$(printf '%03o' $(( 65 + cp ))))" ;;
+            *) printf ''; return 1 ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 get_isp_name() {
@@ -1811,15 +1861,29 @@ install_socks5() {
     #   失败时自动换另一个栈重试一次)。
     #   节点输出不受影响,始终双栈都列出(哪个通列哪个)。
     if [ -n "$upload_url" ]; then
-        local candidates=() tried="" node_name
-        # 上传的节点名与本地节点名保持一致(如 US-Durham-SOCKS5)；
+        local candidates=() tried="" node_name upload_base=""
+        # 上传的节点名与本地节点名保持一致，但在国旗后插入国家码（如 "🇺🇸 US-Chicago-SOCKS5"）：
+        # 链式节点经 Worker 订阅输出后走 subconverter 转 clash，转换器会先删国旗再按
+        # 关键词表补回；表里有国家码(US/JP/DE)规则，纯英文城市名没有，不插国家码国旗必丢。
         # 单栈时补 -V4 / -V6 后缀，避免双栈机器上传后两条重名。
+        # 国家码从国旗反推（get_isp_name 在 $() 子 shell 里跑，全局变量传不出来）
+        upload_base="$isp"
+        local up_cc up_flag
+        up_cc=""; up_flag=${isp%%-*}
+        [ "$up_flag" = "$isp" ] && up_flag=$isp
+        up_cc=$(flag_to_cc "$up_flag")
+        if [ -n "$up_cc" ]; then
+            case "$isp" in
+                "${up_flag}-"*) upload_base="${up_flag} ${up_cc}-${isp#${up_flag}-}" ;;
+                *)              upload_base="${up_flag} ${up_cc}" ;;
+            esac
+        fi
         if [ -n "$host4" ] && [ -z "$host6" ]; then
-            node_name="$isp-SOCKS5-V4"
+            node_name="$upload_base-SOCKS5-V4"
         elif [ -n "$host6" ] && [ -z "$host4" ]; then
-            node_name="$isp-SOCKS5-V6"
+            node_name="$upload_base-SOCKS5-V6"
         else
-            node_name="$isp-SOCKS5"
+            node_name="$upload_base-SOCKS5"
         fi
         if [ -n "$host4" ]; then candidates+=("$host4"); fi
         if [ -n "$host6" ]; then candidates+=("[$host6]"); fi
@@ -2523,6 +2587,31 @@ clear_screen() {
     fi
 }
 env_detect
+
+# --- 传参直装：给了 s5_port / s5_upload 就不进菜单，直接装完 SOCKS5 退出 ---
+#   适合 curl | bash、批量开鸡、SSH 一条命令部署。
+if [ -n "$S5_PORT" ] || [ -n "$S5_UPLOAD" ]; then
+    S5_DIRECT=1
+    cd ~ || exit 1
+    clear_screen
+    ensure_netstat
+    if [ -n "$S5_PORT" ] && ! valid_port "$S5_PORT"; then
+        echo -e "${red}传入的端口不合法: $S5_PORT（需 1-65535 的数字），改用随机空闲端口${re}"
+        S5_PORT=""
+    fi
+    if [ -z "$S5_PORT" ]; then
+        S5_PORT=$(pick_free_port 23470)
+        echo -e "${yellow}未传入 s5_port，已分配空闲端口: $S5_PORT${re}"
+    elif check_port "$S5_PORT"; then
+        echo -e "${red}${S5_PORT}端口已被占用，改用随机空闲端口${re}"
+        S5_PORT=$(rand_port)
+        while check_port "$S5_PORT"; do S5_PORT=$(rand_port); done
+    fi
+    S5_PORT=$(norm_port "$S5_PORT")
+    install_socks5 "$S5_PORT" "$S5_UPLOAD"
+    exit 0
+fi
+
 while true; do
     cd ~ || exit 1
     clear_screen
