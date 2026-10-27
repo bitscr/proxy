@@ -319,6 +319,7 @@ VENDOR_RAW_BASE="${VENDOR_RAW_BASE:-https://raw.githubusercontent.com/bitscr/pro
 VENDOR_XRAY_TAG="v26.3.27"
 VENDOR_HY_TAG="app-v2.13.0"
 VENDOR_TUIC_TAG="tuic-server-1.0.0"
+VENDOR_SB_TAG="v1.14.4"
 
 # CF 优选域名：客户端连它（解析到线路好的 CF 边缘 IP），
 # 但 SNI / Host 仍然填你的回源域名，CF 靠这两个认出你的站点。
@@ -1386,6 +1387,339 @@ restart_ws() {
     svc_restart "xray" "xray"
 }
 
+# ========================= 第 5 项：SOCKS5（sing-box） =========================
+# 学习 eooce/sing-box 的做法：用 sing-box 起 SOCKS5 入站，带用户名密码认证。
+# 二进制同样走本仓库 vendor 固化（sing-box），绝不从上游 latest 拉。
+SB_BIN="/usr/local/bin/sing-box"
+SB_CFG_DIR="/usr/local/etc/sing-box"
+SB_CFG="$SB_CFG_DIR/config.json"
+SB_LINK="$SB_CFG_DIR/link.txt"
+
+# vendor 下载并安装 sing-box 核心（仅 SOCKS5 需要时才装）
+install_singbox_core() {
+    mkdir -p /usr/local/bin
+    local asset sbver
+    sbver=$(echo "$VENDOR_SB_TAG" | sed 's/^v//')
+    case "$(uname -m)" in
+        x86_64|amd64|x86)      asset="sing-box-$sbver-linux-amd64.tar.gz" ;;
+        aarch64|arm64|armv8l)  asset="sing-box-$sbver-linux-arm64.tar.gz" ;;
+        armv7l|armv6l|arm)     asset="sing-box-$sbver-linux-armv7.tar.gz" ;;
+        s390x)                 asset="sing-box-$sbver-linux-s390x.tar.gz" ;;
+        *)
+            echo -e "${red}不支持的架构: $(uname -m)${re}"
+            return 1
+            ;;
+    esac
+    if [ -x "$SB_BIN" ] && "$SB_BIN" version 2>/dev/null | head -2 | grep -q "version $(echo "$VENDOR_SB_TAG" | sed 's/^v//')"; then
+        echo -e "${green}sing-box 已是固化版本 $VENDOR_SB_TAG，跳过下载${re}"
+        return 0
+    fi
+    echo -e "${yellow}正在安装 sing-box $VENDOR_SB_TAG ($asset)，来自本项目 vendor${re}"
+    if ! vendor_fetch "sing-box/$VENDOR_SB_TAG/$asset" /tmp/sb-vendor.tar.gz; then
+        echo -e "${red}vendor 下载 sing-box 失败${re}"
+        return 1
+    fi
+    tar -xzf /tmp/sb-vendor.tar.gz -C /tmp
+    local inner
+    inner=$(tar -tzf /tmp/sb-vendor.tar.gz | head -1)
+    inner="${inner%/}"
+    mv -f "/tmp/$inner/sing-box" "$SB_BIN" 2>/dev/null || mv -f "/tmp/sing-box" "$SB_BIN"
+    rm -f /tmp/sb-vendor.tar.gz
+    rm -rf "/tmp/$inner"
+    chmod +x "$SB_BIN"
+    "$SB_BIN" version 2>/dev/null | head -1 || { echo -e "${red}sing-box 安装后校验失败${re}"; return 1; }
+    echo -e "${green}已安装 sing-box $("$SB_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "$VENDOR_SB_TAG")${re}"
+}
+
+# 写 sing-box SOCKS5 配置
+# $1=端口 $2=用户名 $3=密码
+sb_write_config() {
+    mkdir -p "$SB_CFG_DIR"
+    cat > "$SB_CFG" <<EOF
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "::",
+      "listen_port": $1,
+      "users": [
+        {
+          "username": "$2",
+          "password": "$3"
+        }
+      ]
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+EOF
+    "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1
+}
+
+install_sb_service() {
+    svc_install "sing-box" "sing-box" "sing-box (SOCKS5)" \
+        "$SB_BIN run -c $SB_CFG" "/var/log/sing-box" "https://github.com/SagerNet/sing-box"
+}
+
+# SOCKS5 自测：本机经该 socks5 端口访问公网，能拿出口 IP 即通
+sb_selftest() { # $1=端口 $2=用户名 $3=密码
+    local p=$1 u=$2 w=$3 out
+    echo -e "${yellow}自测中: 经 127.0.0.1:$p 出口访问公网...${re}"
+    out=$(curl -s --max-time 15 --socks5-hostname "127.0.0.1:$p" --user "$u:$w" https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$out" ]; then
+        echo -e "${green}自测通过，出口 IP: $out${re}"
+        return 0
+    fi
+    # 有些 curl 版本对 socks5 认证的写法是 --proxy socks5h://user:pass@host:port
+    out=$(curl -s --max-time 15 --proxy "socks5h://$u:$w@127.0.0.1:$p" https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$out" ]; then
+        echo -e "${green}自测通过，出口 IP: $out${re}"
+        return 0
+    fi
+    echo -e "${red}自测失败: SOCKS5 代理未能返回出口 IP${re}"
+    return 1
+}
+
+# WARP 的 v4 出口落在 Cloudflare 网段(AS13335)。机器公网 IP 自己属于
+# Cloudflare 的概率极低(Cloudflare 不卖算力)，所以查 ipinfo 归属:
+# 出口 IP 归属 Cloudflare = 走了 WARP，那不是机器入站地址，必须丢弃。
+# 归属查询失败(网络不通)时保留 IP，宁交给面板实测，不可本地误杀。
+is_cloudflare_egress() { # $1=ipv4  返回0=WARP出口
+    local org
+    org=$(curl -s --max-time 6 "https://ipinfo.io/$1/org" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case "$org" in
+        "" ) return 1 ;;
+        *cloudflare*|*as13335*|*13335*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# SOCKS5 用:分别探测公网 IPv4 / IPv6(排除 WARP 出口)。
+# 双栈机器两条都拿到；单栈拿到能通的那条；都探测不到则两条为空。
+get_public_ip4() {
+    local ip
+    ip=$(curl -s --max-time 5 https://ipv4.ip.sb 2>/dev/null | tr -d '[:space:]')
+    printf '%s' "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || ip=""
+    # v4 出口是 Cloudflare 网段 = WARP 出口，机器入站连不回来，丢弃
+    if [ -n "$ip" ] && is_cloudflare_egress "$ip"; then
+        ip=""
+    fi
+    printf '%s' "$ip"
+}
+
+# 返回裸 IPv6(不带方括号)；WARP 段(2a09:bac5::/32 等)不算机器真实地址，丢弃
+get_public_ip6() {
+    local ip
+    ip=$(curl -s --max-time 5 https://ipv6.ip.sb 2>/dev/null | tr -d '[:space:]')
+    case "$ip" in
+        *:*) ;;
+        *) ip="" ;;
+    esac
+    if [ -n "$ip" ] && is_warp_ip "$ip"; then
+        ip=""
+    fi
+    printf '%s' "$ip"
+}
+
+# 把本机 SOCKS5 节点上传到链式代理面板(Worker 的 /admin/chain/add 接口)
+# $1=面板上传地址(含 ?token=...) $2=公网地址 $3=端口 $4=用户名 $5=密码
+# 注意: 地址里含令牌，错误输出里不回显它；用户名密码拼链接前做 URL 编码
+upload_chain_node() {
+    local upload_url=$1 host=$2 port=$3 user=$4 pass=$5
+    local eu ep uplink body code ok stage err name nip rtime
+    install_soft jq
+    eu=$(printf '%s' "$user" | jq -sRr @uri)
+    ep=$(printf '%s' "$pass" | jq -sRr @uri)
+    uplink="socks5://$eu:$ep@$host:$port"
+    body=$(jq -n --arg url "$uplink" '{url: $url}')
+    echo -e "${yellow}正在上传节点到链式代理面板（最长 45 秒，面板会实测一次代理）...${re}"
+    code=$(curl -s --max-time 45 -o /tmp/chain-resp.json -w '%{http_code}' \
+        -X POST "$upload_url" -H "Content-Type: application/json" -d "$body" 2>/dev/null)
+    if [ "$code" = "000" ]; then
+        echo -e "${red}上传失败: 请求面板超时或网络不通（45 秒内无响应）${re}"
+        rm -f /tmp/chain-resp.json
+        return 1
+    fi
+    ok=$(jq -r '.success // empty' /tmp/chain-resp.json 2>/dev/null)
+    if [ "$ok" = "true" ]; then
+        name=$(jq -r '.node.name // "未命名"' /tmp/chain-resp.json 2>/dev/null)
+        nip=$(jq -r '.node.ip // "?"' /tmp/chain-resp.json 2>/dev/null)
+        rtime=$(jq -r '.node.responseTime // "?"' /tmp/chain-resp.json 2>/dev/null)
+        echo -e "${green}上传成功！面板命名: $name（落地IP: $nip，延迟 ${rtime}ms）${re}"
+        echo -e "${yellow}节点已进入面板的「链式代理节点」列表，订阅自动生效。${re}"
+        rm -f /tmp/chain-resp.json
+        return 0
+    fi
+    stage=$(jq -r '.stage // empty' /tmp/chain-resp.json 2>/dev/null)
+    err=$(jq -r '.error // empty' /tmp/chain-resp.json 2>/dev/null)
+    case "$stage" in
+        test)
+            echo -e "${red}上传失败: 面板连不上这台机器的代理（stage=test）。${re}"
+            echo -e "${yellow}检查: 代理监听 0.0.0.0:$port（不能只听 127.0.0.1）、防火墙/安全组放行、公网可达。${re}"
+            echo -e "${yellow}本机在 NAT 后（家庭宽带/部分容器）时，需先做端口映射或 TCP 隧道暴露成公网地址。${re}"
+            ;;
+        parse)
+            echo -e "${red}上传失败: 代理链接格式无效（stage=parse）。${re}"
+            echo -e "${yellow}检查: 用户名/密码里的特殊字符、IPv6 要写成 [地址]:端口。${re}"
+            ;;
+        *)
+            if [ "$code" = "401" ]; then
+                echo -e "${red}上传失败: 令牌无效或缺失（401），用面板「外部上传接口」里显示的完整地址。${re}"
+            else
+                echo -e "${red}上传失败: HTTP $code ${err}${re}"
+            fi
+            ;;
+    esac
+    rm -f /tmp/chain-resp.json
+    return 1
+}
+
+# 一键安装 SOCKS5(第 5 项)
+# $1=端口 $2=用户名 $3=密码 $4=链式代理面板上传地址(可选, 空=不上传)
+install_socks5() {
+    local port=$1 user=$2 pass=$3 upload_url=${4:-} host4 host6 isp
+    install_soft curl
+    install_soft jq
+    ensure_netstat
+
+    env_detect
+    echo -e "$(env_line)"
+    if [ -x "$SB_BIN" ]; then need=10; else need=40; fi
+    if ! env_precheck "$need" "SOCKS5" ; then
+        press_any_key_to_continue
+        return 1
+    fi
+    kernel_tune
+
+    echo -e "${green}SOCKS5 正在安装中，请稍候...${re}"
+
+    install_singbox_core || { press_any_key_to_continue; return 1; }
+
+    if ! sb_write_config "$port" "$user" "$pass"; then
+        echo -e "${red}错误: sing-box 配置校验失败${re}"
+        press_any_key_to_continue
+        return 1
+    fi
+
+    install_sb_service
+    sleep 2
+
+    # 双栈探测:分别拿 IPv4 / IPv6(排除 WARP)。哪个通输出哪个,双栈输出两条。
+    host4=$(get_public_ip4)
+    host6=$(get_public_ip6)
+    isp=$(get_isp_name)
+    local pass_enc link4 link6
+    pass_enc=$(printf '%s' "$pass" | jq -sRr @uri)
+    if [ -n "$host4" ]; then
+        link4="socks5://$user:$pass_enc@$host4:$port#$isp-SOCKS5"
+    fi
+    if [ -n "$host6" ]; then
+        link6="socks5://$user:$pass_enc@[${host6}]:$port#$isp-SOCKS5"
+    fi
+    : > "$SB_LINK"
+    [ -n "$link4" ] && printf '%s\n' "$link4" >> "$SB_LINK"
+    [ -n "$link6" ] && printf '%s\n' "$link6" >> "$SB_LINK"
+
+    echo ""
+    echo -e "${green}SOCKS5 安装成功！${re}"
+    echo -e "${green}服务状态: $(svc_state "sing-box" "sing-box")${re}"
+    echo -e "${skyblue}监听: [::]:$port${re}"
+    echo -e "${skyblue}用户名: $user${re}"
+    echo -e "${skyblue}密码: $pass${re}"
+    if [ -n "$host4" ] && [ -n "$host6" ]; then
+        echo -e "${skyblue}网络: 双栈（IPv4 + IPv6 都可用）${re}"
+    elif [ -n "$host4" ]; then
+        echo -e "${skyblue}网络: 仅 IPv4${re}"
+    elif [ -n "$host6" ]; then
+        echo -e "${skyblue}网络: 仅 IPv6${re}"
+    else
+        echo -e "${red}警告: 探测不到公网 IPv4/IPv6（本机可能是内网/NAT 环境）${re}"
+        echo -e "${yellow}请把下面链接里的主机名手动改成你的公网地址再导入客户端。${re}"
+    fi
+    echo -e "${skyblue}节点链接: ${re}"
+    [ -n "$link4" ] && echo -e "${skyblue}$link4${re}"
+    [ -n "$link6" ] && echo -e "${skyblue}$link6${re}"
+    echo -e "${yellow}提醒: SOCKS5 是明文协议，走公网请务必只在内网/受信环境用，或套 TLS 包装(如 gost)后再出公网。${re}"
+    echo -e "${yellow}本机防火墙记得放行 $port 端口。${re}"
+    echo ""
+    sb_selftest "$port" "$user" "$pass"
+    echo ""
+    # 上传语义(用户拍板):按「入站可达」上传——
+    #   哪个栈能被外部连进来就传哪个；两个都可达传 v4(Worker 实测连通性是最终裁判,
+    #   失败时自动换另一个栈重试一次)。
+    #   节点输出不受影响,始终双栈都列出(哪个通列哪个)。
+    if [ -n "$upload_url" ]; then
+        local candidates=() tried=""
+        if [ -n "$host4" ]; then candidates+=("$host4"); fi
+        if [ -n "$host6" ]; then candidates+=("[$host6]"); fi
+        if [ "${#candidates[@]}" -eq 0 ]; then
+            echo -e "${red}跳过上传: 探测不到本机公网 IPv4/IPv6 地址${re}"
+        else
+            for up_host in "${candidates[@]}"; do
+                if upload_chain_node "$upload_url" "$up_host" "$port" "$user" "$pass"; then
+                    break
+                fi
+                tried="$tried $up_host"
+                echo -e "${yellow}该地址上传未成功，尝试下一个栈...${re}"
+            done
+        fi
+    fi
+    echo ""
+    press_any_key_to_continue
+}
+
+# 卸载 SOCKS5(第 5 项)
+uninstall_socks5() {
+    env_detect
+    svc_remove "sing-box" "sing-box"
+    rm -f "$SB_BIN"
+    rm -rf "$SB_CFG_DIR" /var/log/sing-box
+    echo -e "${green}SOCKS5 已卸载${re}"
+}
+
+# 换 SOCKS5 端口
+change_socks5_port() {
+    install_soft jq
+    ensure_netstat
+    read -p $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+    [[ -z "$new_port" ]] && new_port=$(rand_port)
+    while check_port "$new_port"; do
+        echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -p $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+        [[ -z "$new_port" ]] && new_port=$(rand_port)
+    done
+    if [ ! -f "$SB_CFG" ]; then
+        echo -e "${red}未检测到 SOCKS5 配置（$SB_CFG 不存在）${re}"
+        press_any_key_to_continue
+        return 0
+    fi
+    jq --argjson new_port "$new_port" '.inbounds[0].listen_port = $new_port' "$SB_CFG" > /tmp/sb-cfg.new && mv /tmp/sb-cfg.new "$SB_CFG"
+    if ! "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1; then
+        echo -e "${red}错误: 改端口后配置校验失败${re}"
+        return 1
+    fi
+    svc_restart "sing-box" "sing-box"
+    # 同步重写链接(双栈两条都改端口)
+    if [ -f "$SB_LINK" ]; then
+        sed -i "s|:[0-9]\{1,5\}#$|:$new_port#|g" "$SB_LINK"
+    fi
+    echo -e "${green}SOCKS5 监听端口已改为 $new_port${re}"
+    echo -e "${white}新链接: ${re}$(cat "$SB_LINK" 2>/dev/null)"
+    echo -e "${yellow}确认本机防火墙放行 $new_port${re}"
+    press_any_key_to_continue
+}
+
+restart_socks5() {
+    svc_restart "sing-box" "sing-box"
+}
+
 restart_reality() {
     svc_restart "xray" "xray"
 }
@@ -2013,6 +2347,7 @@ while true; do
     echo -e "${green}---------------------------------------------------------${re}"
     echo -e "${white} 1. Hysteria2一键脚本        2. Reality一键脚本${re}"
     echo -e "${white} 3. Tuic-V5一键脚本          4. VLESS+WS一键脚本${re}"
+    echo -e "${white} 5. SOCKS5一键脚本${re}"
     echo -e "${yellow}---------------------------------------------------------${re}"
     echo -e "$(env_line)"
     echo -e "${skyblue} 0. 退出脚本${re}"
@@ -2337,6 +2672,53 @@ while true; do
                         ;;
                     3)
                         uninstall_ws
+                        break
+                        ;;
+                    0)
+                        break
+                        ;;
+                    *)
+                        echo -e "${red}无效的输入!${re}"
+                        sleep 1
+                        ;;
+                esac
+            done
+            ;;
+        5) # SOCKS5 子菜单
+            while true; do
+                clear
+                echo "--------------"
+                echo -e "${green}1. 安装 SOCKS5${re}"
+                echo -e "${yellow}2. 更换 SOCKS5 端口${re}"
+                echo -e "${red}3. 卸载 SOCKS5${re}"
+                echo "--------------"
+                echo -e "${skyblue}0. 返回上一级菜单${re}"
+                echo "--------------"
+                read -p $'\033[1;91m请输入你的选择: \033[0m' s5_sub_choice
+                case $s5_sub_choice in
+                    1)
+                        read -p $'\033[1;35m请输入 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
+                        [ -z "$s5_port" ] && { s5_port=$(rand_port); echo -e "${yellow}未输入端口,已为您分配随机端口: $s5_port${re}"; }
+                        while check_port "$s5_port"; do
+                            echo -e "${red}${s5_port}端口已经被其他程序占用,请更换端口重试${re}"
+                            read -p $'\033[1;35m设置 SOCKS5 端口[1-65535] (回车跳过将使用随机端口): \033[0m' s5_port
+                            [ -z "$s5_port" ] && s5_port=$(rand_port)
+                        done
+                        read -p $'\033[1;35m请输入 SOCKS5 用户名 (回车默认 s5user): \033[0m' s5_user
+                        [ -z "$s5_user" ] && s5_user="s5user"
+                        read -p $'\033[1;35m请输入 SOCKS5 密码 (回车则随机生成): \033[0m' s5_pass
+                        [ -z "$s5_pass" ] && { s5_pass=$(rand_token); echo -e "${yellow}已生成随机密码: $s5_pass${re}"; }
+                        # 链式代理面板上传（默认跳过）
+                        read -p $'\033[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): \033[0m' s5_upload
+                        install_socks5 "$s5_port" "$s5_user" "$s5_pass" "$s5_upload"
+                        break
+                        ;;
+                    2)
+                        change_socks5_port
+                        break
+                        ;;
+                    3)
+                        uninstall_socks5
                         break
                         ;;
                     0)

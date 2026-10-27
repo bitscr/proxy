@@ -19,6 +19,7 @@
 | Xray | `v26.3.27` | 64 / arm64-v8a / arm32-v7a / 32 |
 | Hysteria | `app-v2.13.0` | amd64 / arm64 / arm / 386 |
 | TUIC | `tuic-server-1.0.0` | 10 个 linux 变体（gnu + musl） |
+| sing-box | `v1.14.4` | amd64 / arm64 / armv7 / s390x |
 
 TUIC 收录 musl 变体是为了 Alpine 小机器能直接跑（脚本会按 `tuic_arch_candidates` 逐个尝试）。
 
@@ -30,7 +31,7 @@ TUIC 收录 musl 变体是为了 Alpine 小机器能直接跑（脚本会按 `tu
 - 与 `SHA256SUMS` 比对，不一致**直接拒绝安装**，不做任何降级尝试
 - 清单里查不到该文件同样拒绝
 
-校验值来源可信：Xray 对官方 `.dgst`、Hysteria 对官方 `hashes.txt`、TUIC 对官方 `.sha256sum`，三者逐条比对一致后才落库。
+校验值来源可信：Xray 对官方 `.dgst`、Hysteria 对官方 `hashes.txt`、TUIC 对官方 `.sha256sum`，三者逐条比对一致后才落库。sing-box 官方 release 不提供校验清单，采用**两次独立下载逐字节比对 + 解压实跑验证**后落库。
 
 ## 自己校验
 
