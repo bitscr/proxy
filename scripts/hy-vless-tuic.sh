@@ -807,6 +807,35 @@ geo_pick() { # $1=json $2=jq表达式 $3=awk字段名
     printf '%s' "$out"
 }
 
+# 国家码 -> 国旗 emoji。原理：Regional Indicator Symbol 的码点
+# = 0x1F1E6 + (字母 - 'A')，两个字母拼起来就是国旗。
+# 用 printf 生成 UTF-8 字节，不依赖 locale/iconv：
+#   🇯🇵 = U+1F1EF U+1F1F5 -> F0 9F 87 AF F0 9F 87 B5
+country_flag() { # $1=两位国家码(大小写均可)  输出国旗或空
+    local cc
+    cc=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    case "$cc" in
+        [A-Z][A-Z]) ;;
+        *) return 1 ;;
+    esac
+    # 逐字节算：'A'=0x41 -> 0x1F1E6
+    # 码点 = 0x1F1E6 + (c - 0x41) = 0x1F1A5 + c
+    # 拆成 UTF-8 四字节: 11110uuu 10uuzzzz 10yyyyyy 10xxxxxx
+    local c1 c2 out=""
+    for c1 in "${cc:0:1}" "${cc:1:1}"; do
+        local cp b1 b2 b3 b4
+        cp=$(( 0x1F1A5 + $(printf '%d' "'$c1") ))
+        b1=$(( 0xF0 | (cp >> 18) ))
+        b2=$(( 0x80 | ((cp >> 12) & 0x3F) ))
+        b3=$(( 0x80 | ((cp >> 6) & 0x3F) ))
+        b4=$(( 0x80 | (cp & 0x3F) ))
+        # 用八进制转义而不是 \xNN：dash / busybox ash 不认 \x，会原样打印。
+        # POSIX 只保证 \0NNN（三位八进制），所以这里统一转八进制。
+        out="$out$(printf '\\%03o\\%03o\\%03o\\%03o' "$b1" "$b2" "$b3" "$b4")"
+    done
+    printf '%b' "$out"
+}
+
 get_isp_name() {
     local meta c="" i="" txt=""
     # 源1 ipinfo.io：country / city
@@ -833,7 +862,16 @@ get_isp_name() {
     [ -n "$c" ] && txt="$c"
     [ -n "$c" ] && [ -n "$i" ] && txt="$c-$i"
     [ -z "$txt" ] && txt="node"
-    printf '%s' "$txt" | tr ' ' '_' | tr -d '"#'
+    # 先把城市里的空格转成下划线，再加国旗。
+    # 顺序很重要：若先加国旗再 tr，国旗与"国家码-城市"之间的分隔空格也会被换成下划线。
+    txt=$(printf '%s' "$txt" | tr ' ' '_' | tr -d '"#')
+    # 节点名格式：🇯🇵 JP-Tokyo（国旗 + 空格 + 国家码-城市）
+    if [ -n "$c" ]; then
+        local flag
+        flag=$(country_flag "$c" 2>/dev/null)
+        [ -n "$flag" ] && txt="$flag $txt"
+    fi
+    printf '%s' "$txt"
 }
 
 # 安装官方静态 Xray（Go 静态构建，musl 上可直接运行）
