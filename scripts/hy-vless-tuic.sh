@@ -1821,13 +1821,13 @@ setup_alpine_autorun() {
         cat > /etc/local.d/proxy_autorun.start <<EOF
 #!/bin/sh
 
-# Hysteria2 自启检测（仅兼容旧版 eooce 容器脚本安装；新版由 /etc/init.d/hysteria 服务单元负责）
+# Hysteria2 自启检测（仅兼容旧版容器脚本安装；新版由 /etc/init.d/hysteria 服务单元负责）
 if [ -f "/root/web" ] && [ -f "/root/config.yaml" ] && [ ! -x /usr/local/bin/hysteria ]; then
     cd /root
     nohup ./web server config.yaml >/dev/null 2>&1 &
 fi
 
-# Reality 自启检测（仅兼容旧版 eooce/test.sh 安装；新版由 /etc/init.d/xray 服务单元负责）
+# Reality 自启检测（仅兼容旧版脚本安装；新版由 /etc/init.d/xray 服务单元负责）
 if [ -f "/root/app/web" ] && [ -f "/root/app/config.json" ] && [ ! -x /usr/local/bin/xray ]; then
     cd /root
     nohup ./app/web -c ./app/config.json >/dev/null 2>&1 &
@@ -2425,7 +2425,7 @@ while true; do
                         rm -f "$HY_BIN"
                         rm -rf "$HY_DIR" /var/log/hysteria
                         rm -f /tmp/hysteria-selftest.yaml
-                        # 清理旧版（eooce 容器脚本）在 /root 下留的文件，含那个来源不明的 npm
+                        # 清理旧版（容器脚本）在 /root 下留的文件，含那个来源不明的 npm
                         kill_by_cmdline "server config.yaml"
                         kill_by_cmdline "npm"
                         rm -rf /root/web /root/npm /root/server.crt /root/server.key /root/config.yaml
@@ -2462,7 +2462,7 @@ while true; do
                             fi
                             hy_selftest "$new_port" "$hy_pass"
                         elif [ -f "/root/config.yaml" ]; then
-                            # 兼容旧版（eooce 容器脚本）安装
+                            # 兼容旧版（容器脚本）安装
                             sed -i "s/^listen: :[0-9]*/listen: :$new_port/" /root/config.yaml
                             kill_by_cmdline "server config.yaml"
                             cd /root
@@ -2540,7 +2540,7 @@ while true; do
                         cd ~
                         env_detect
                         svc_remove "xray" "xray"
-                        # 兼容旧版 eooce/test.sh 安装（二进制伪装成 /root/app/web）
+                        # 兼容旧版脚本安装（二进制伪装成 /root/app/web）
                         kill_by_cmdline "app/web"
                         rm -rf /root/app
                         # 两个平台都清掉官方 Xray 本体与配置
@@ -2584,7 +2584,7 @@ while true; do
                                 echo -e "${yellow}链接重新生成失败（多半是探测不到公网 IP），请把客户端里的端口手动改成 $new_port${re}"
                             fi
                         elif [ -f "/root/app/config.json" ]; then
-                            # 兼容旧版 eooce/test.sh 安装
+                            # 兼容旧版脚本安装
                             jq --argjson new_port "$new_port" '.inbounds[0].port = $new_port' /root/app/config.json > /tmp/legacy-cfg.new && mv /tmp/legacy-cfg.new /root/app/config.json
                             kill_by_cmdline "app/web"
                             cd /root
