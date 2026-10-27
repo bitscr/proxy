@@ -27,8 +27,11 @@ fi
 # ============================================================================
 
 # 当前脚本文件名（提示文案用，改名后也不会对不上）
+# bash <(curl ...) 或 curl | bash 时 $0 是 "bash"，此时用固定名
 SELF="${0##*/}"
-[ -z "$SELF" ] && SELF="hy-vless-tuic.sh"
+case "$SELF" in
+    bash|sh|dash|-bash|-sh|"") SELF="np.sh" ;;
+esac
 
 # --- 颜色定义 ---
 red='\033[0;31m'
@@ -120,7 +123,7 @@ ENV_OS=""; ENV_INIT=""; ENV_ARCH=""; ENV_MUSL=0; ENV_RAM_MB=0; ENV_DISK_FREE_MB=
 # 写 sysctl：/etc/sysctl.d 优先，不行就 /etc/sysctl.conf，再不行直接 /proc（重启失效但本次有效）
 # 注意：/etc 写成功了但 /proc 写不进去时（受限容器），配置只对下次重启生效——返回值如实反映
 sysctl_apply() { # $1=key $2=value；返回 0=本次运行已生效，1=仅持久化或完全失败
-    local key=$1 val=$2 live=0 saved=0 conf=""
+    local key=$1 val=$2 live=0 conf=""
     # 1) 直接写 /proc 立即生效。
     # 不能用 [ -w ] 判断：root 对只读挂载的 /proc/sys 也显示"可写"，只有真写一次才知道
     # 注意：'... > file 2>/dev/null' 管不住这个错误——shell 是先打开文件再跑命令，
@@ -138,9 +141,7 @@ sysctl_apply() { # $1=key $2=value；返回 0=本次运行已生效，1=仅持�
     if [ -n "$conf" ]; then
         # 同键已配置过就不重复追加（幂等）
         if ! grep -qE "^[[:space:]]*net\.[/.]${key#net/}[[:space:]]*=" "$conf" 2>/dev/null; then
-            printf '\n# added by proxy script\n%s = %s\n' "$(echo "$key" | tr '/' '.')" "$val" >> "$conf" 2>/dev/null && saved=1
-        else
-            saved=1
+            printf '\n# added by proxy script\n%s = %s\n' "$(echo "$key" | tr '/' '.')" "$val" >> "$conf" 2>/dev/null
         fi
     fi
     [ "$live" = 1 ] && return 0
@@ -332,6 +333,8 @@ http_fetch() { # $1=url $2=输出文件
     elif has wget; then
         wget -q -T 30 -t 3 -O "$2" "$1"
     else
+        echo -e "${red}错误: 本机没有 curl 也没有 wget，无法下载${re}" >&2
+        echo -e "${yellow}请先安装其一（Alpine: apk add curl / Debian: apt-get install -y curl）${re}" >&2
         return 127
     fi
 }
@@ -412,6 +415,29 @@ rand_token() { # 12 位随机串
     od -An -tx1 -N8 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-12
 }
 
+# 校验端口是否合法(纯数字 + 1-65535)。返回 0=合法
+# 用户输入 abc / 99999 / -1 / 0 这类值以前会直接写进配置，导致服务起不来，
+# 而且报错指向内核而不是输入，很难查。
+valid_port() {
+    local p=$1
+    case "$p" in
+        ''|*[!0-9]*) return 1 ;;   # 空 或 含非数字字符
+    esac
+    [ "${#p}" -le 5 ] || return 1
+    p=$((10#$p))                   # 去前导零：08 会被 jq --argjson 当非法 JSON 数字
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+# 把用户输入的端口规范化成十进制整数并打印(去前导零)
+# 08 -> 8；jq --argjson 只认规范数字，带前导零会直接报错退出。
+norm_port() {
+    local p=$1
+    case "$p" in
+        ''|*[!0-9]*) printf '%s' "$p"; return 1 ;;
+    esac
+    printf '%d' "$((10#$p))"
+}
+
 rand_port() { # 2000-65000 随机端口
     if has shuf; then
         shuf -i 2000-65000 -n 1
@@ -427,7 +453,8 @@ pick_free_port() {
         printf '%s' "$pref"
         return 0
     fi
-    for i in $(seq 1 50); do
+    # 不用 seq：极简环境（busybox 精简版）可能没有，纯 bash 循环最稳
+    for ((i = 0; i < 50; i++)); do
         p=$(rand_port)
         if ! check_port "$p"; then
             printf '%s' "$p"
@@ -821,7 +848,7 @@ country_flag() { # $1=两位国家码(大小写均可)  输出国旗或空
     # 逐字节算：'A'=0x41 -> 0x1F1E6
     # 码点 = 0x1F1E6 + (c - 0x41) = 0x1F1A5 + c
     # 拆成 UTF-8 四字节: 11110uuu 10uuzzzz 10yyyyyy 10xxxxxx
-    local c1 c2 out=""
+    local c1 out=""
     for c1 in "${cc:0:1}" "${cc:1:1}"; do
         local cp b1 b2 b3 b4
         cp=$(( 0x1F1A5 + $(printf '%d' "'$c1") ))
@@ -1146,7 +1173,7 @@ EOF
 # CF 边缘接受的访客端口（HTTPS）。客户端连 CF 只能用这里面之一；
 # 但 CF → 源站的端口由 Origin Rules 的「Destination port」改写，1-65535 任意，
 # 所以源站监听端口不受这个列表限制。本脚本节点链接固定输出 443（最通用）。
-CF_EDGE_PORTS="443 2053 2083 2087 2096 8443"
+# CF 边缘可接受端口(仅供提示参考,源站端口不受此限制,靠 Origin Rule 改写)
 
 # 自测用 127.0.0.1 连自己,先验证服务端 TLS/WS/路径可用,与 CF 是否配好无关。
 ws_selftest() { # $1=port $2=uuid $3=path $4=security $5=ServerName/Host(可空)
@@ -1398,13 +1425,15 @@ uninstall_ws() {
 change_ws_port() {
     install_soft jq
     ensure_netstat
-    read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（源站监听端口；走 CF 的话改完记得把 Origin Rule 的 Destination port 同步成它，回车跳过则随机）：\033[0m' new_port
+    read -rp $'\033[1;35m设置 VLESS+WS 端口[1-65535]（源站监听端口；走 CF 的话改完记得把 Origin Rule 的 Destination port 同步成它，回车跳过则随机）：\033[0m' new_port
     [[ -z "$new_port" ]] && new_port=$(rand_port)
-    while check_port "$new_port"; do
-        echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-        read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+    while ! valid_port "$new_port" || check_port "$new_port"; do
+        valid_port "$new_port" || echo -e "${red}端口不合法: $new_port（需 1-65535 的数字），请重新输入${re}"
+        valid_port "$new_port" && echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -rp $'\033[1;35m设置 VLESS+WS 端口[1-65535]（回车跳过则随机）：\033[0m' new_port
         [[ -z "$new_port" ]] && new_port=$(rand_port)
     done
+    new_port=$(norm_port "$new_port")
     if [ ! -f "$XRAY_CFG" ]; then
         echo -e "${red}未检测到 VLESS+WS 配置（$XRAY_CFG 不存在）${re}"
         press_any_key_to_continue
@@ -1515,6 +1544,12 @@ install_singbox_core() {
 # $1=端口 $2=用户名 $3=密码
 sb_write_config() {
     mkdir -p "$SB_CFG_DIR"
+    # 监听地址按本机能力选：有 IPv6 用 "::"（双栈），没有就只能 0.0.0.0。
+    # 内核禁用 IPv6 时绑 "::" 会直接启动失败，小机器/精简系统上很常见。
+    local listen_addr="::"
+    if [ ! -f /proc/net/if_inet6 ] || [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = "1" ]; then
+        listen_addr="0.0.0.0"
+    fi
     cat > "$SB_CFG" <<EOF
 {
   "log": {
@@ -1525,7 +1560,7 @@ sb_write_config() {
     {
       "type": "socks",
       "tag": "socks-in",
-      "listen": "::",
+      "listen": "$listen_addr",
       "listen_port": $1,
       "users": [
         {
@@ -1622,7 +1657,12 @@ get_public_ip6() {
 upload_chain_node() {
     local upload_url=$1 host=$2 port=$3 user=$4 pass=$5 node_name=${6:-}
     local eu ep uplink body code ok stage err name nip rtime
-    install_soft jq
+    # jq 是上传的硬依赖：装不上就直接退出并说明原因，
+    # 否则 body 会是空串，curl -d "" 发出空请求，报错会指向面板而不是缺 jq。
+    if ! install_soft jq || ! command -v jq >/dev/null 2>&1; then
+        echo -e "${red}上传失败: 缺少 jq 且无法自动安装，请先手动安装 jq 后重试${re}"
+        return 1
+    fi
     eu=$(printf '%s' "$user" | jq -sRr @uri)
     ep=$(printf '%s' "$pass" | jq -sRr @uri)
     uplink="socks5://$eu:$ep@$host:$port"
@@ -1807,13 +1847,15 @@ uninstall_socks5() {
 change_socks5_port() {
     install_soft jq
     ensure_netstat
-    read -p $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+    read -rp $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
     [[ -z "$new_port" ]] && new_port=$(rand_port)
-    while check_port "$new_port"; do
-        echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-        read -p $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
+    while ! valid_port "$new_port" || check_port "$new_port"; do
+        valid_port "$new_port" || echo -e "${red}端口不合法: $new_port（需 1-65535 的数字），请重新输入${re}"
+        valid_port "$new_port" && echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+        read -rp $'\033[1;35m设置 SOCKS5 新端口[1-65535]（回车跳过则随机）：\033[0m' new_port
         [[ -z "$new_port" ]] && new_port=$(rand_port)
     done
+    new_port=$(norm_port "$new_port")
     if [ ! -f "$SB_CFG" ]; then
         echo -e "${red}未检测到 SOCKS5 配置（$SB_CFG 不存在）${re}"
         press_any_key_to_continue
@@ -1912,13 +1954,13 @@ setup_alpine_autorun() {
 
 # Hysteria2 自启检测（仅兼容旧版容器脚本安装；新版由 /etc/init.d/hysteria 服务单元负责）
 if [ -f "/root/web" ] && [ -f "/root/config.yaml" ] && [ ! -x /usr/local/bin/hysteria ]; then
-    cd /root
+    cd /root || return 0
     nohup ./web server config.yaml >/dev/null 2>&1 &
 fi
 
 # Reality 自启检测（仅兼容旧版脚本安装；新版由 /etc/init.d/xray 服务单元负责）
 if [ -f "/root/app/web" ] && [ -f "/root/app/config.json" ] && [ ! -x /usr/local/bin/xray ]; then
-    cd /root
+    cd /root || return 0
     nohup ./app/web -c ./app/config.json >/dev/null 2>&1 &
 fi
 
@@ -1986,8 +2028,13 @@ install_hysteria_core() {
 hy_write_config() {
     local port=$1 pass=$2
     mkdir -p "$HY_DIR"
+    # 同 sing-box：内核禁用 IPv6 时绑 ":" 会启动失败，退回 0.0.0.0
+    local hy_listen=":"
+    if [ ! -f /proc/net/if_inet6 ] || [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = "1" ]; then
+        hy_listen="0.0.0.0:"
+    fi
     cat > "$HY_CFG" <<EOF
-listen: :$port
+listen: ${hy_listen}$port
 
 tls:
   cert: $HY_DIR/server.crt
@@ -2318,18 +2365,20 @@ install_tuic() {
 
     echo ""
     local port
-    read -p $'\033[1;35m请输入 Tuic 端口 (10000-65000, 回车使用随机端口): \033[0m' port
+    read -rp $'\033[1;35m请输入 Tuic 端口 (10000-65000, 回车使用随机端口): \033[0m' port
     [ -z "$port" ] && port=$(rand_port)
 
-    while check_port "$port"; do
-        echo -e "${red}端口 ${port} 已被占用，请更换端口重试！${re}"
-        read -p $'\033[1;35m请输入 Tuic 端口 (10000-65000, 回车使用随机端口): \033[0m' port
+    while ! valid_port "$port" || check_port "$port"; do
+        valid_port "$port" || echo -e "${red}端口不合法: $port（需 1-65535 的数字），请重新输入${re}"
+        valid_port "$port" && echo -e "${red}端口 ${port} 已被占用，请更换端口重试！${re}"
+        read -rp $'\033[1;35m请输入 Tuic 端口 (10000-65000, 回车使用随机端口): \033[0m' port
         [ -z "$port" ] && port=$(rand_port)
     done
+    port=$(norm_port "$port")
     echo -e "${green}Tuic 端口: ${port}${re}"
 
     local password
-    read -p $'\033[1;35m请输入您想设定的密码 (回车使用随机密码): \033[0m' password
+    read -rp $'\033[1;35m请输入您想设定的密码 (回车使用随机密码): \033[0m' password
     [ -z "$password" ] && password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 8 | head -n 1)
     echo -e "${green}Tuic 密码: ${password}${re}"
 
@@ -2337,7 +2386,7 @@ install_tuic() {
     echo -e "${green}Tuic UUID: ${UUID}${re}"
     if [ -z "$UUID" ]; then
         echo -e "${red}错误: 生成 UUID 失败！${re}"
-        cd ~
+        cd ~ || return 0
         press_any_key_to_continue
         return
     fi
@@ -2362,7 +2411,7 @@ install_tuic() {
     echo ""
     tuic_health_check "$port"
     echo ""
-    cd ~
+    cd ~ || return 0
     press_any_key_to_continue
 }
 
@@ -2381,13 +2430,14 @@ change_tuic_config() {
     fi
 
     # 获取当前UUID和密码
-    local current_uuid=$(jq -r '.users | to_entries[0].key' "$config_file" 2>/dev/null)
-    local current_password=$(jq -r ".users[\"$current_uuid\"]" "$config_file" 2>/dev/null)
-    local current_port=$(jq -r '.server' "$config_file" | awk -F":" '{print $NF}' | tr -d '"')
+    local current_uuid current_password current_port
+    current_uuid=$(jq -r '.users | to_entries[0].key' "$config_file" 2>/dev/null)
+    current_password=$(jq -r ".users[\"$current_uuid\"]" "$config_file" 2>/dev/null)
+    current_port=$(jq -r '.server' "$config_file" | awk -F":" '{print $NF}' | tr -d '"')
 
     # 更改 UUID
     local new_uuid
-    read -p $'\033[1;35m请输入新的 UUID (或回车使用随机 UUID，当前: '$current_uuid'): \033[0m' new_uuid
+    read -rp $'\033[1;35m请输入新的 UUID (或回车使用随机 UUID，当前: '$current_uuid'): \033[0m' new_uuid
     [ -z "$new_uuid" ] && new_uuid=$(openssl rand -hex 16 | awk '{print substr($0,1,8)"-"substr($0,9,4)"-"substr($0,13,4)"-"substr($0,17,4)"-"substr($0,21,12)}')
 
     jq --arg old_uuid "$current_uuid" --arg new_uuid "$new_uuid" --arg password "$current_password" \
@@ -2396,14 +2446,16 @@ change_tuic_config() {
 
     # 更改端口
     local new_port
-    read -p $'\033[1;35m请输入新的端口 (或回车使用随机端口，当前: '$current_port'): \033[0m' new_port
+    read -rp $'\033[1;35m请输入新的端口 (或回车使用随机端口，当前: '$current_port'): \033[0m' new_port
     [ -z "$new_port" ] && new_port=$(rand_port)
 
-    while check_port "$new_port"; do
-        echo -e "${red}端口 ${new_port} 已被占用，请更换端口重试！${re}"
-        read -p $'\033[1;35m请输入新的端口 (或回车使用随机端口): \033[0m' new_port
+    while ! valid_port "$new_port" || check_port "$new_port"; do
+        valid_port "$new_port" || echo -e "${red}端口不合法: $new_port（需 1-65535 的数字），请重新输入${re}"
+        valid_port "$new_port" && echo -e "${red}端口 ${new_port} 已被占用，请更换端口重试！${re}"
+        read -rp $'\033[1;35m请输入新的端口 (或回车使用随机端口): \033[0m' new_port
         [ -z "$new_port" ] && new_port=$(rand_port)
     done
+    new_port=$(norm_port "$new_port")
 
     jq --argjson new_port "$new_port" '.server = ("[::]:" + ($new_port|tostring))' "$config_file" > /tmp/tuic-tmp.json && mv /tmp/tuic-tmp.json "$config_file"
     echo -e "${green}新的 PORT: $new_port${re}"
@@ -2458,10 +2510,17 @@ if [ -f "/etc/alpine-release" ]; then
 fi
 
 # --- 主菜单 ---
+# clear 在 TERM 未设置时（cron、curl | bash、容器 exec 无 tty）会往 stderr
+# 吐 "TERM environment variable not set."，很难看且会误导用户以为出错了。
+clear_screen() {
+    if [ -n "$TERM" ] && [ -t 1 ]; then
+        clear 2>/dev/null || true
+    fi
+}
 env_detect
 while true; do
     cd ~ || exit 1
-    clear
+    clear_screen
     echo -e "${purple}▶ 节点搭建脚本合集${re}"
     echo -e "${green}---------------------------------------------------------${re}"
     echo -e "${white} 1. Hysteria2一键脚本        2. Reality一键脚本${re}"
@@ -2471,11 +2530,11 @@ while true; do
     echo -e "$(env_line)"
     echo -e "${skyblue} 0. 退出脚本${re}"
     echo "---------------"
-    read -p $'\033[1;91m请输入你的选择: \033[0m' main_choice
+    read -rp $'\033[1;91m请输入你的选择: \033[0m' main_choice
     case $main_choice in
         1) # Hysteria2 子菜单
             while true; do
-                clear
+                clear_screen
                 echo "--------------"
                 echo -e "${green}1.安装Hysteria2${re}"
                 echo -e "${red}2.卸载Hysteria2${re}"
@@ -2483,32 +2542,34 @@ while true; do
                 echo "--------------"
                 echo -e "${skyblue}0. 返回上一级菜单${re}"
                 echo "--------------"
-                read -p $'\033[1;91m请输入你的选择: \033[0m' sub_choice
+                read -rp $'\033[1;91m请输入你的选择: \033[0m' sub_choice
                 case $sub_choice in
                     1) # 安装Hysteria2
-                        clear
-                        cd ~
+                        clear_screen
+                        cd ~ || return 0
                         ensure_netstat
-                        read -p $'\033[1;35m请输入Hysteria2节点端口(nat小鸡请输入可用端口范围内的端口),回车跳过则使用随机端口：\033[0m' port
+                        read -rp $'\033[1;35m请输入Hysteria2节点端口(nat小鸡请输入可用端口范围内的端口),回车跳过则使用随机端口：\033[0m' port
                         if [[ -z "$port" ]]; then
                             port=$(rand_port)
                             echo -e "${yellow}未输入端口，已为您分配随机端口: $port${re}"
                         fi
 
-                        while check_port "$port"; do
-                            echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
-                            read -p $'\033[1;35m设置Hysteria2端口[1-65535]（回车将使用随机端口）：\033[0m' port
+                        while ! valid_port "$port" || check_port "$port"; do
+                            valid_port "$port" || echo -e "${red}端口不合法: $port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$port" && echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置Hysteria2端口[1-65535]（回车将使用随机端口）：\033[0m' port
                             if [[ -z "$port" ]]; then
                                 port=$(rand_port)
                                 echo -e "${yellow}未输入端口，已为您分配随机端口: $port${re}"
                             fi
                         done
+                        port=$(norm_port "$port")
 
                         install_hysteria "$port"
                         break
                         ;;
                     2) # 卸载Hysteria2
-                        cd ~
+                        cd ~ || return 0
                         env_detect
                         svc_remove "hysteria-server" "hysteria"
                         rm -f "$HY_BIN"
@@ -2523,22 +2584,24 @@ while true; do
                         break
                         ;;
                     3) # 更换Hysteria2端口
-                        clear
-                        cd ~
+                        clear_screen
+                        cd ~ || return 0
                         ensure_netstat
-                        read -p $'\033[1;35m设置Hysteria2端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
+                        read -rp $'\033[1;35m设置Hysteria2端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
                         [[ -z "$new_port" ]] && new_port=$(rand_port)
 
-                        while check_port "$new_port"; do
-                            echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-                            read -p $'\033[1;35m设置Hysteria2端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
+                        while ! valid_port "$new_port" || check_port "$new_port"; do
+                            valid_port "$new_port" || echo -e "${red}端口不合法: $new_port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$new_port" && echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置Hysteria2端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
                             [[ -z "$new_port" ]] && new_port=$(rand_port)
                         done
+                        new_port=$(norm_port "$new_port")
 
                         hy_pass=""
                         if [ -f "$HY_CFG" ]; then
                             hy_pass=$(sed -n 's/^[[:space:]]*password:[[:space:]]*"\(.*\)".*/\1/p' "$HY_CFG" | head -1)
-                            sed -i "s/^listen: :[0-9]*/listen: :$new_port/" "$HY_CFG"
+                            sed -i "s|^listen: [^:]*:[0-9]*|listen: ${hy_listen:-:}$new_port|" "$HY_CFG"
                             restart_hysteria
                             sleep 2
                             hy_link=$(hy_build_link "$new_port" "$hy_pass")
@@ -2554,7 +2617,7 @@ while true; do
                             # 兼容旧版（容器脚本）安装
                             sed -i "s/^listen: :[0-9]*/listen: :$new_port/" /root/config.yaml
                             kill_by_cmdline "server config.yaml"
-                            cd /root
+                            cd /root || return 0
                             nohup ./web server config.yaml >/dev/null 2>&1 &
                             setup_alpine_autorun # 更新自启
                             echo -e "${green}Hysteria2(旧版) 端口已更换成 $new_port，请手动更改客户端配置!${re}"
@@ -2576,7 +2639,7 @@ while true; do
             ;;
         2) # Reality 子菜单
             while true; do
-                clear
+                clear_screen
                 echo "--------------"
                 echo -e "${green}1.安装Reality${re}"
                 echo -e "${red}2.卸载Reality${re}"
@@ -2584,32 +2647,34 @@ while true; do
                 echo "--------------"
                 echo -e "${skyblue}0. 返回上一级菜单${re}"
                 echo "--------------"
-                read -p $'\033[1;91m请输入你的选择: \033[0m' sub_choice
+                read -rp $'\033[1;91m请输入你的选择: \033[0m' sub_choice
                 case $sub_choice in
                     1) # 安装Reality
-                        clear
-                        cd ~
+                        clear_screen
+                        cd ~ || return 0
                         ensure_netstat
-                        read -p $'\033[1;35m请输入reality节点端口(nat小鸡请输入可用端口范围内的端口),回车跳过则使用随机端口：\033[0m' port
+                        read -rp $'\033[1;35m请输入reality节点端口(nat小鸡请输入可用端口范围内的端口),回车跳过则使用随机端口：\033[0m' port
                         if [[ -z "$port" ]]; then
                             port=$(rand_port)
                             echo -e "${yellow}未输入端口，已为您分配随机端口: $port${re}"
                         fi
 
-                        while check_port "$port"; do
-                            echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
-                            read -p $'\033[1;35m设置 reality 端口[1-65535]（回车跳过将使用随机端口）：\033[0m' port
+                        while ! valid_port "$port" || check_port "$port"; do
+                            valid_port "$port" || echo -e "${red}端口不合法: $port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$port" && echo -e "${red}${port}端口已经被其他程序占用，请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置 reality 端口[1-65535]（回车跳过将使用随机端口）：\033[0m' port
                             if [[ -z "$port" ]]; then
                                 port=$(rand_port)
                                 echo -e "${yellow}未输入端口，已为您分配随机端口: $port${re}"
                             fi
                         done
+                        port=$(norm_port "$port")
 
                         echo ""
                         sni=""
                         sni_tries=0
                         while [ -z "$sni" ]; do
-                            read -p $'\033[1;35m请输入伪装域名 SNI (回车默认 www.amd.com): \033[0m' sni_input
+                            read -rp $'\033[1;35m请输入伪装域名 SNI (回车默认 www.amd.com): \033[0m' sni_input
                             [ -z "$sni_input" ] && sni_input="www.amd.com"
                             if timeout 6 bash -c "exec 3<>/dev/tcp/$sni_input/443" 2>/dev/null; then
                                 sni="$sni_input"
@@ -2626,7 +2691,7 @@ while true; do
                         break
                         ;;
                     2) # 卸载Reality
-                        cd ~
+                        cd ~ || return 0
                         env_detect
                         svc_remove "xray" "xray"
                         # 兼容旧版脚本安装（二进制伪装成 /root/app/web）
@@ -2642,18 +2707,20 @@ while true; do
                         break
                         ;;
                     3) # 更换Reality端口
-                        clear
-                        cd ~
+                        clear_screen
+                        cd ~ || return 0
                         install_soft jq
                         ensure_netstat
-                        read -p $'\033[1;35m设置 reality 端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
+                        read -rp $'\033[1;35m设置 reality 端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
                         [[ -z "$new_port" ]] && new_port=$(rand_port)
 
-                        while check_port "$new_port"; do
-                            echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-                            read -p $'\033[1;35m设置reality端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
+                        while ! valid_port "$new_port" || check_port "$new_port"; do
+                            valid_port "$new_port" || echo -e "${red}端口不合法: $new_port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$new_port" && echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置reality端口[1-65535]（回车跳过将使用随机端口）：\033[0m' new_port
                             [[ -z "$new_port" ]] && new_port=$(rand_port)
                         done
+                        new_port=$(norm_port "$new_port")
 
                         if [ -f "$XRAY_CFG" ]; then
                             # 新版：官方 Xray + 统一配置路径
@@ -2676,7 +2743,7 @@ while true; do
                             # 兼容旧版脚本安装
                             jq --argjson new_port "$new_port" '.inbounds[0].port = $new_port' /root/app/config.json > /tmp/legacy-cfg.new && mv /tmp/legacy-cfg.new /root/app/config.json
                             kill_by_cmdline "app/web"
-                            cd /root
+                            cd /root || return 0
                             nohup ./app/web -c ./app/config.json >/dev/null 2>&1 &
                             setup_alpine_autorun # 更新自启
                             echo -e "${green}Reality(旧版) 端口已更换成 $new_port，请手动更改客户端配置!${re}"
@@ -2698,7 +2765,7 @@ while true; do
             ;;
         3) # Tuic-V5 子菜单
             while true; do
-                clear
+                clear_screen
                 echo "--------------"
                 echo -e "${green}1. 安装或重新安装 Tuic-V5${re}"
                 echo -e "${yellow}2. 更改 Tuic-V5 配置 (UUID/端口)${re}"
@@ -2706,12 +2773,12 @@ while true; do
                 echo "--------------"
                 echo -e "${skyblue}0. 返回上一级菜单${re}"
                 echo "--------------"
-                read -p $'\033[1;91m请输入你的选择: \033[0m' tuic_sub_choice
+                read -rp $'\033[1;91m请输入你的选择: \033[0m' tuic_sub_choice
                 case $tuic_sub_choice in
                     1)
                         if [ -d "/root/tuic" ]; then
                             echo -e "${yellow}检测到 Tuic 已安装.${re}"
-                            read -p $'\033[1;35m您想重新安装吗? (y/N): \033[0m' reinstall_confirm
+                            read -rp $'\033[1;35m您想重新安装吗? (y/N): \033[0m' reinstall_confirm
                             if [[ "$reinstall_confirm" =~ ^[Yy]$ ]]; then
                                 uninstall_tuic
                                 install_tuic
@@ -2743,7 +2810,7 @@ while true; do
             ;;
         4) # VLESS+WS 子菜单
             while true; do
-                clear
+                clear_screen
                 echo "--------------"
                 echo -e "${green}1. 安装 VLESS+WS${re}"
                 echo -e "${yellow}2. 更换 VLESS+WS 端口${re}"
@@ -2751,27 +2818,29 @@ while true; do
                 echo "--------------"
                 echo -e "${skyblue}0. 返回上一级菜单${re}"
                 echo "--------------"
-                read -p $'\033[1;91m请输入你的选择: \033[0m' ws_sub_choice
+                read -rp $'\033[1;91m请输入你的选择: \033[0m' ws_sub_choice
                 case $ws_sub_choice in
                     1)
                         # 端口 = 源站监听端口，任意 1-65535，不因回源域名而改写
-                        read -p $'\033[1;35m请输入 VLESS+WS 端口[1-65535] (回车跳过则随机；这个端口是源站监听端口): \033[0m' ws_port
+                        read -rp $'\033[1;35m请输入 VLESS+WS 端口[1-65535] (回车跳过则随机；这个端口是源站监听端口): \033[0m' ws_port
                         # 回源域名
-                        read -p $'\033[1;35m请输入回源域名 (用 Cloudflare CDN 加速就填,不填则输出机器 IP+端口直连): \033[0m' ws_origin
+                        read -rp $'\033[1;35m请输入回源域名 (用 Cloudflare CDN 加速就填,不填则输出机器 IP+端口直连): \033[0m' ws_origin
                         # 源站端口：空输入给随机端口，被占用则要求重填。两种模式都一样，不改写。
                         if [ -z "$ws_port" ]; then
                             ws_port=$(rand_port)
                             echo -e "${yellow}未输入端口,已为您分配随机端口: $ws_port${re}"
                         fi
-                        while check_port "$ws_port"; do
-                            echo -e "${red}${ws_port}端口已经被其他程序占用,请更换端口重试${re}"
-                            read -p $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
+                        while ! valid_port "$ws_port" || check_port "$ws_port"; do
+                            valid_port "$ws_port" || echo -e "${red}端口不合法: $ws_port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$ws_port" && echo -e "${red}${ws_port}端口已经被其他程序占用,请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置 VLESS+WS 端口[1-65535] (回车跳过将使用随机端口): \033[0m' ws_port
                             [ -z "$ws_port" ] && ws_port=$(rand_port)
                         done
+                        ws_port=$(norm_port "$ws_port")
                         # 回源加密方式：只对填了回源域名的才有意义
                         ws_mode="full"
                         if [ -n "$ws_origin" ]; then
-                            read -p $'\033[1;35m源站是否启用 TLS（Cloudflare SSL 模式设 Full）? (Y/n 回车=Yes): \033[0m' ws_tls_ans
+                            read -rp $'\033[1;35m源站是否启用 TLS（Cloudflare SSL 模式设 Full）? (Y/n 回车=Yes): \033[0m' ws_tls_ans
                             case "$ws_tls_ans" in
                                 [Nn]*|"no"*|"NO"*) ws_mode="flexible" ;;
                                 *) ws_mode="full" ;;
@@ -2805,7 +2874,7 @@ while true; do
             ;;
         5) # SOCKS5 子菜单
             while true; do
-                clear
+                clear_screen
                 echo "--------------"
                 echo -e "${green}1. 安装 SOCKS5${re}"
                 echo -e "${yellow}2. 更换 SOCKS5 端口${re}"
@@ -2813,21 +2882,23 @@ while true; do
                 echo "--------------"
                 echo -e "${skyblue}0. 返回上一级菜单${re}"
                 echo "--------------"
-                read -p $'\033[1;91m请输入你的选择: \033[0m' s5_sub_choice
+                read -rp $'\033[1;91m请输入你的选择: \033[0m' s5_sub_choice
                 case $s5_sub_choice in
                     1)
                         # 只问端口(回车则随机)，用户名密码自动随机
-                        read -p $'\033[1;35m请输入 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
+                        read -rp $'\033[1;35m请输入 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
                         if [ -z "$s5_port" ]; then
                             s5_port=$(rand_port)
                             echo -e "${yellow}未输入端口,已分配随机端口: $s5_port${re}"
                         fi
-                        while check_port "$s5_port"; do
-                            echo -e "${red}${s5_port}端口已被占用,请更换端口重试${re}"
-                            read -p $'\033[1;35m设置 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
+                        while ! valid_port "$s5_port" || check_port "$s5_port"; do
+                            valid_port "$s5_port" || echo -e "${red}端口不合法: $s5_port（需 1-65535 的数字），请重新输入${re}"
+                            valid_port "$s5_port" && echo -e "${red}${s5_port}端口已被占用,请更换端口重试${re}"
+                            read -rp $'\033[1;35m设置 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
                             [ -z "$s5_port" ] && s5_port=$(rand_port)
                         done
-                        read -p $'\033[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): \033[0m' s5_upload
+                        s5_port=$(norm_port "$s5_port")
+                        read -rp $'\033[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): \033[0m' s5_upload
                         install_socks5 "$s5_port" "$s5_upload"
                         break
                         ;;
