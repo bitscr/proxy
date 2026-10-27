@@ -886,18 +886,22 @@ get_isp_name() {
         fi
         i=$(geo_pick "$meta" '.city' 'city')
     fi
-    [ -n "$c" ] && txt="$c"
-    [ -n "$c" ] && [ -n "$i" ] && txt="$c-$i"
+    [ -n "$i" ] && txt="$i"
     [ -z "$txt" ] && txt="node"
     # 先把城市里的空格转成下划线，再拼国旗。
-    # 用 "-" 连接国旗与国家码，整个节点名保持单段不间断，
-    # 客户端按空格切分节点名时不会被拆坏。
+    # 国旗本身就代表国家，名字里不再重复国家码，避免 "🇺🇸-US-Durham" 这种冗余。
     txt=$(printf '%s' "$txt" | tr ' ' '_' | tr -d '"#')
-    # 节点名格式：🇯🇵-JP-Tokyo（国旗 + 连字符 + 国家码-城市）
+    # 节点名格式：🇺🇸-Durham（国旗 + 连字符 + 城市）
     if [ -n "$c" ]; then
         local flag
         flag=$(country_flag "$c" 2>/dev/null)
-        [ -n "$flag" ] && txt="$flag-$txt"
+        if [ -n "$flag" ]; then
+            # 拿不到城市时只留国旗；拿到国旗就替代国家码
+            if [ "$txt" = "node" ]; then txt="$flag"; else txt="$flag-$txt"; fi
+        else
+            # 国旗拼不出来（异常国家码）时退回国家码，至少不丢国家信息
+            if [ "$txt" = "node" ]; then txt="$c"; else txt="$c-$txt"; fi
+        fi
     fi
     printf '%s' "$txt"
 }
