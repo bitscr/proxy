@@ -1413,20 +1413,29 @@ SB_CFG="$SB_CFG_DIR/config.json"
 SB_LINK="$SB_CFG_DIR/link.txt"
 
 # vendor 下载并安装 sing-box 核心（仅 SOCKS5 需要时才装）
+# 官方默认包是 glibc 动态链接，Alpine(musl) 上会直接 Exec format error / 找不到
+# ld-linux 而失败。musl 系统必须取 -musl 变体（s390x 无 musl 包，只能 glibc）。
 install_singbox_core() {
     mkdir -p /usr/local/bin
-    local asset sbver
+    local asset sbver arch musl=0
     sbver=$(echo "$VENDOR_SB_TAG" | sed 's/^v//')
+    [ -f /etc/alpine-release ] && musl=1
+    has ldd && ldd --version 2>&1 | grep -qi musl && musl=1
     case "$(uname -m)" in
-        x86_64|amd64|x86)      asset="sing-box-$sbver-linux-amd64.tar.gz" ;;
-        aarch64|arm64|armv8l)  asset="sing-box-$sbver-linux-arm64.tar.gz" ;;
-        armv7l|armv6l|arm)     asset="sing-box-$sbver-linux-armv7.tar.gz" ;;
-        s390x)                 asset="sing-box-$sbver-linux-s390x.tar.gz" ;;
+        x86_64|amd64|x86)      arch="amd64" ;;
+        aarch64|arm64|armv8l)  arch="arm64" ;;
+        armv7l|armv6l|arm)     arch="armv7" ;;
+        s390x)                 arch="s390x" ;;
         *)
             echo -e "${red}不支持的架构: $(uname -m)${re}"
             return 1
             ;;
     esac
+    asset="sing-box-$sbver-linux-$arch.tar.gz"
+    # musl 变体：amd64/arm64/armv7 有，s390x 没有（退回 glibc）
+    if [ "$musl" = 1 ] && [ "$arch" != "s390x" ]; then
+        asset="sing-box-$sbver-linux-$arch-musl.tar.gz"
+    fi
     if [ -x "$SB_BIN" ] && "$SB_BIN" version 2>/dev/null | head -2 | grep -q "version $(echo "$VENDOR_SB_TAG" | sed 's/^v//')"; then
         echo -e "${green}sing-box 已是固化版本 $VENDOR_SB_TAG，跳过下载${re}"
         return 0
@@ -1440,12 +1449,28 @@ install_singbox_core() {
     local inner
     inner=$(tar -tzf /tmp/sb-vendor.tar.gz | head -1)
     inner="${inner%/}"
-    mv -f "/tmp/$inner/sing-box" "$SB_BIN" 2>/dev/null || mv -f "/tmp/sing-box" "$SB_BIN"
+    # 整个目录内容都装过去：1.14 起包里除 sing-box 还有 libcronet.so 等附属文件，
+    # 只拷二进制会在某些平台上缺库（之前只 mv sing-box，属隐患）
+    if [ -d "/tmp/$inner" ]; then
+        mkdir -p /usr/local/lib/sing-box
+        cp -f "/tmp/$inner/sing-box" "$SB_BIN"
+        local extra
+        for extra in "/tmp/$inner"/*.so; do
+            [ -f "$extra" ] && cp -f "$extra" /usr/local/lib/sing-box/ 2>/dev/null
+        done
+        rm -rf "/tmp/$inner"
+    else
+        mv -f /tmp/sing-box "$SB_BIN"
+    fi
     rm -f /tmp/sb-vendor.tar.gz
-    rm -rf "/tmp/$inner"
     chmod +x "$SB_BIN"
-    "$SB_BIN" version 2>/dev/null | head -1 || { echo -e "${red}sing-box 安装后校验失败${re}"; return 1; }
-    echo -e "${green}已安装 sing-box $("$SB_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "$VENDOR_SB_TAG")${re}"
+    # 装完必须真跑一次版本命令：musl/glibc 选错时这里就会暴露（Exec format error）
+    if ! "$SB_BIN" version >/tmp/sb-ver.log 2>&1; then
+        echo -e "${red}sing-box 装完无法执行（多半是 libc 不匹配）：$(head -2 /tmp/sb-ver.log)${re}"
+        return 1
+    fi
+    echo -e "${green}已安装 sing-box $(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /tmp/sb-ver.log | head -1)${re}"
+    rm -f /tmp/sb-ver.log
 }
 
 # 写 sing-box SOCKS5 配置
@@ -1477,7 +1502,15 @@ sb_write_config() {
   ]
 }
 EOF
-    "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1
+    # 校验并把 sing-box 的真实报错抛出来（吞掉 stderr 会把 libc 不匹配伪装成"配置错误"）
+    if ! "$SB_BIN" check -c "$SB_CFG" >/tmp/sbcheck.log 2>&1; then
+        echo -e "${red}sing-box 配置校验失败:${re}"
+        sed -n '1,3p' /tmp/sbcheck.log | while IFS= read -r l; do echo -e "${yellow}  $l${re}"; done
+        rm -f /tmp/sbcheck.log
+        return 1
+    fi
+    rm -f /tmp/sbcheck.log
+    return 0
 }
 
 install_sb_service() {
@@ -1599,17 +1632,21 @@ upload_chain_node() {
 }
 
 # 一键安装 SOCKS5(第 5 项)
-# 用户名/密码随机生成,全程免交互(不提示、不接受输入)。
-# $1=链式代理面板上传地址(可选, 空=不上传)
+# 端口由用户输入(回车随机)；用户名/密码全随机，不问。
+# $1=端口(可空) $2=链式代理面板上传地址(可空)
 install_socks5() {
-    local upload_url=${1:-}
-    # 端口自动选空闲; 用户名/密码全随机(共 32 位 hex, 足够强度)
-    local port user pass host4 host6 isp
-    port=$(pick_free_port 23470)
+    local port=$1 upload_url=${2:-}
+    local user pass host4 host6 isp
+    # 端口没给就随机挑一个空闲的
+    if [ -z "$port" ]; then
+        port=$(pick_free_port 23470)
+        echo -e "${yellow}未指定端口，已分配空闲端口: $port${re}"
+    fi
+    # 用户名/密码全随机(共 32 位 hex),不再询问
     local rnd
     rnd=$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')
     if [ "${#rnd}" -lt 64 ]; then
-        echo -e "${red}错误: 无法从 /dev/urandom 取随机数${re}"
+        echo -e "${red}错误: 无法取得随机数${re}"
         press_any_key_to_continue
         return 1
     fi
@@ -2727,9 +2764,19 @@ while true; do
                 read -p $'\033[1;91m请输入你的选择: \033[0m' s5_sub_choice
                 case $s5_sub_choice in
                     1)
-                        # 端口/用户名/密码全部自动随机,零交互;只问一次面板上传地址(可回车跳过)
-                        read -p $'[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): [0m' s5_upload
-                        install_socks5 "$s5_upload"
+                        # 只问端口(回车则随机)，用户名密码自动随机
+                        read -p $'\033[1;35m请输入 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
+                        if [ -z "$s5_port" ]; then
+                            s5_port=$(rand_port)
+                            echo -e "${yellow}未输入端口,已分配随机端口: $s5_port${re}"
+                        fi
+                        while check_port "$s5_port"; do
+                            echo -e "${red}${s5_port}端口已被占用,请更换端口重试${re}"
+                            read -p $'\033[1;35m设置 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
+                            [ -z "$s5_port" ] && s5_port=$(rand_port)
+                        done
+                        read -p $'\033[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): \033[0m' s5_upload
+                        install_socks5 "$s5_port" "$s5_upload"
                         break
                         ;;
                     2)

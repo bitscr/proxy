@@ -20,3 +20,6 @@ adb808944ca829857bf408d2ee438a156e8171543dbbed3e94964b66b4135393  vendor/tuic/tu
 436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-arm64.tar.gz
 fd164ed45ebc784f657a3e1d0e0ad0f68afdcff864ee57122c2cfed3ddb80a00  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-armv7.tar.gz
 316b2fe8217d34aeab89782712246473d114850b065ad58ecf73daabcb58bbe9  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-s390x.tar.gz
+8f7c5f0651238850d96a0e488e5473cd77ec1a0098f63942e943f475a12057ca  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-amd64-musl.tar.gz
+b95e25f921dc5e17a4cf13327243d1177642c7e35425bf5372862c477c359f56  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-arm64-musl.tar.gz
+27c225479cd675e6d9b43e3e293c00ace72b693781c4a25b5c0de313d8c712df  vendor/sing-box/v1.14.4/sing-box-1.14.4-linux-armv7-musl.tar.gz
