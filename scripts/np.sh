@@ -889,14 +889,15 @@ get_isp_name() {
     [ -n "$c" ] && txt="$c"
     [ -n "$c" ] && [ -n "$i" ] && txt="$c-$i"
     [ -z "$txt" ] && txt="node"
-    # 先把城市里的空格转成下划线，再加国旗。
-    # 顺序很重要：若先加国旗再 tr，国旗与"国家码-城市"之间的分隔空格也会被换成下划线。
+    # 先把城市里的空格转成下划线，再拼国旗。
+    # 用 "-" 连接国旗与国家码，整个节点名保持单段不间断，
+    # 客户端按空格切分节点名时不会被拆坏。
     txt=$(printf '%s' "$txt" | tr ' ' '_' | tr -d '"#')
-    # 节点名格式：🇯🇵 JP-Tokyo（国旗 + 空格 + 国家码-城市）
+    # 节点名格式：🇯🇵-JP-Tokyo（国旗 + 连字符 + 国家码-城市）
     if [ -n "$c" ]; then
         local flag
         flag=$(country_flag "$c" 2>/dev/null)
-        [ -n "$flag" ] && txt="$flag $txt"
+        [ -n "$flag" ] && txt="$flag-$txt"
     fi
     printf '%s' "$txt"
 }
