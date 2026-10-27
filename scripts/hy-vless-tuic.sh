@@ -412,12 +412,29 @@ rand_token() { # 12 位随机串
     od -An -tx1 -N8 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-12
 }
 
-rand_port() { # 10000-65000
+rand_port() { # 2000-65000 随机端口
     if has shuf; then
         shuf -i 2000-65000 -n 1
     else
         awk 'BEGIN{srand(); printf "%d\n", 2000+int(rand()*63001)}'
     fi
+}
+
+# 取一个未被占用的随机端口。$1=首选端口(可选);首选空闲就用首选,否则随机重试。
+pick_free_port() {
+    local pref=${1:-} p i
+    if [ -n "$pref" ] && ! check_port "$pref"; then
+        printf '%s' "$pref"
+        return 0
+    fi
+    for i in $(seq 1 50); do
+        p=$(rand_port)
+        if ! check_port "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    printf '%s' "$(rand_port)"   # 极端情况兜底
 }
 
 # 端口工具：netstat / ss 都没有时才装 net-tools（能少装一个包就少装）
@@ -1388,7 +1405,7 @@ restart_ws() {
 }
 
 # ========================= 第 5 项：SOCKS5（sing-box） =========================
-# 学习 eooce/sing-box 的做法：用 sing-box 起 SOCKS5 入站，带用户名密码认证。
+# 用 sing-box 起 SOCKS5 入站，带用户名密码认证。
 # 二进制同样走本仓库 vendor 固化（sing-box），绝不从上游 latest 拉。
 SB_BIN="/usr/local/bin/sing-box"
 SB_CFG_DIR="/usr/local/etc/sing-box"
@@ -1582,9 +1599,22 @@ upload_chain_node() {
 }
 
 # 一键安装 SOCKS5(第 5 项)
-# $1=端口 $2=用户名 $3=密码 $4=链式代理面板上传地址(可选, 空=不上传)
+# 用户名/密码随机生成,全程免交互(不提示、不接受输入)。
+# $1=链式代理面板上传地址(可选, 空=不上传)
 install_socks5() {
-    local port=$1 user=$2 pass=$3 upload_url=${4:-} host4 host6 isp
+    local upload_url=${1:-}
+    # 端口自动选空闲; 用户名/密码全随机(共 32 位 hex, 足够强度)
+    local port user pass host4 host6 isp
+    port=$(pick_free_port 23470)
+    local rnd
+    rnd=$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [ "${#rnd}" -lt 64 ]; then
+        echo -e "${red}错误: 无法从 /dev/urandom 取随机数${re}"
+        press_any_key_to_continue
+        return 1
+    fi
+    user="s5${rnd:0:10}"
+    pass="${rnd:10:32}"
     install_soft curl
     install_soft jq
     ensure_netstat
@@ -2697,20 +2727,9 @@ while true; do
                 read -p $'\033[1;91m请输入你的选择: \033[0m' s5_sub_choice
                 case $s5_sub_choice in
                     1)
-                        read -p $'\033[1;35m请输入 SOCKS5 端口[1-65535] (回车跳过则随机): \033[0m' s5_port
-                        [ -z "$s5_port" ] && { s5_port=$(rand_port); echo -e "${yellow}未输入端口,已为您分配随机端口: $s5_port${re}"; }
-                        while check_port "$s5_port"; do
-                            echo -e "${red}${s5_port}端口已经被其他程序占用,请更换端口重试${re}"
-                            read -p $'\033[1;35m设置 SOCKS5 端口[1-65535] (回车跳过将使用随机端口): \033[0m' s5_port
-                            [ -z "$s5_port" ] && s5_port=$(rand_port)
-                        done
-                        read -p $'\033[1;35m请输入 SOCKS5 用户名 (回车默认 s5user): \033[0m' s5_user
-                        [ -z "$s5_user" ] && s5_user="s5user"
-                        read -p $'\033[1;35m请输入 SOCKS5 密码 (回车则随机生成): \033[0m' s5_pass
-                        [ -z "$s5_pass" ] && { s5_pass=$(rand_token); echo -e "${yellow}已生成随机密码: $s5_pass${re}"; }
-                        # 链式代理面板上传（默认跳过）
-                        read -p $'\033[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): \033[0m' s5_upload
-                        install_socks5 "$s5_port" "$s5_user" "$s5_pass" "$s5_upload"
+                        # 端口/用户名/密码全部自动随机,零交互;只问一次面板上传地址(可回车跳过)
+                        read -p $'[1;35m上传到链式代理面板? 粘贴面板「外部上传接口」完整地址则装完自测通过后自动上传 (回车跳过): [0m' s5_upload
+                        install_socks5 "$s5_upload"
                         break
                         ;;
                     2)
