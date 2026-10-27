@@ -889,30 +889,6 @@ country_flag() { # $1=两位国家码(大小写均可)  输出国旗或空
     printf '%b' "$out"
 }
 
-# 从国旗 emoji 反推两位国家码（country_flag 的逆运算）：
-# 🇺🇸 = f0 9f 87 ba f0 9f 87 b8 -> 码点 0x1F1FA/0x1F1F8 -> 'U'/'S'。
-# 用途：clash 订阅经 subconverter 转换时会先删国旗再按关键词表补回，
-# 表里有国家码(US/JP)规则但没有英文城市名，上传名里带上国家码国旗才能回来。
-flag_to_cc() { # $1=国旗emoji  输出大写国家码或空
-    local f=$1 out="" b cp i
-    f=$(printf '%s' "$f" | od -An -tx1 | tr -d ' \n')
-    # 每个旗子字符是 4 字节 UTF-8；取第一个字符的后 3 字节算码点
-    [ ${#f} -ge 16 ] || { printf ''; return 1; }
-    for i in 0 8; do
-        b=${f:$((i+2)):6}   # 跳过 F0/F1 首字节，取后 3 字节的 hex
-        cp=$(( 0x$(printf '%s' "${b:0:2}") & 0x3F )); cp=$(( cp * 64 ))
-        cp=$(( cp + (0x$(printf '%s' "${b:2:2}") & 0x3F) )); cp=$(( cp * 64 ))
-        cp=$(( cp + (0x$(printf '%s' "${b:4:2}") & 0x3F) ))
-        # 0x41='A'，0x1F1E6+'A' 起算
-        cp=$(( cp - 0x1F1E6 ))
-        case $(( cp + 0 )) in
-            0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25) out="$out$(printf \\$(printf '%03o' $(( 65 + cp ))))" ;;
-            *) printf ''; return 1 ;;
-        esac
-    done
-    printf '%s' "$out"
-}
-
 get_isp_name() {
     local meta c="" i="" txt=""
     # 源1 ipinfo.io：country / city
@@ -1861,37 +1837,20 @@ install_socks5() {
     #   失败时自动换另一个栈重试一次)。
     #   节点输出不受影响,始终双栈都列出(哪个通列哪个)。
     if [ -n "$upload_url" ]; then
-        local candidates=() tried="" node_name upload_base=""
-        # 上传的节点名与本地节点名保持一致，但在国旗后插入国家码（如 "🇺🇸 US-Chicago-SOCKS5"）：
-        # 链式节点经 Worker 订阅输出后走 subconverter 转 clash，转换器会先删国旗再按
-        # 关键词表补回；表里有国家码(US/JP/DE)规则，纯英文城市名没有，不插国家码国旗必丢。
-        # 单栈时补 -V4 / -V6 后缀，避免双栈机器上传后两条重名。
-        # 国家码从国旗反推（get_isp_name 在 $() 子 shell 里跑，全局变量传不出来）
-        upload_base="$isp"
-        local up_cc up_flag
-        up_cc=""; up_flag=${isp%%-*}
-        [ "$up_flag" = "$isp" ] && up_flag=$isp
-        up_cc=$(flag_to_cc "$up_flag")
-        if [ -n "$up_cc" ]; then
-            case "$isp" in
-                "${up_flag}-"*) upload_base="${up_flag} ${up_cc}-${isp#${up_flag}-}" ;;
-                *)              upload_base="${up_flag} ${up_cc}" ;;
-            esac
-        fi
-        if [ -n "$host4" ] && [ -z "$host6" ]; then
-            node_name="$upload_base-SOCKS5-V4"
-        elif [ -n "$host6" ] && [ -z "$host4" ]; then
-            node_name="$upload_base-SOCKS5-V6"
-        else
-            node_name="$upload_base-SOCKS5"
-        fi
+        local candidates=() tried=""
+        # 节点名交给 Worker 自动生成，脚本不传 name。
+        # 原因：Worker 自动命名是「国旗 中文国家名 中文城市」（如 "🇮🇱 以色列 耶路撒冷"），
+        # 中文国家名在 subconverter 的 emoji 规则表里，转 clash 时国旗能原样保住；
+        # 而脚本自拼的「🇮🇱-Jerusalem-SOCKS5」删掉国旗后剩纯英文，表里查不到就丢国旗
+        # （IL/AE/BR/ZA 等国家码表里根本没有，只有 US/JP/DE 等 23 个有码规则）。
+        # 双栈/单栈的区分改由 Worker 按实测落地地区自动处理，重名自动加序号。
         if [ -n "$host4" ]; then candidates+=("$host4"); fi
         if [ -n "$host6" ]; then candidates+=("[$host6]"); fi
         if [ "${#candidates[@]}" -eq 0 ]; then
             echo -e "${red}跳过上传: 探测不到本机公网 IPv4/IPv6 地址${re}"
         else
             for up_host in "${candidates[@]}"; do
-                if upload_chain_node "$upload_url" "$up_host" "$port" "$user" "$pass" "$node_name"; then
+                if upload_chain_node "$upload_url" "$up_host" "$port" "$user" "$pass" ""; then
                     break
                 fi
                 tried="$tried $up_host"
