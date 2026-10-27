@@ -1579,16 +1579,21 @@ get_public_ip6() {
 }
 
 # 把本机 SOCKS5 节点上传到链式代理面板(Worker 的 /admin/chain/add 接口)
-# $1=面板上传地址(含 ?token=...) $2=公网地址 $3=端口 $4=用户名 $5=密码
+# $1=面板上传地址(含 ?token=...) $2=公网地址 $3=端口 $4=用户名 $5=密码 $6=节点名(可空)
 # 注意: 地址里含令牌，错误输出里不回显它；用户名密码拼链接前做 URL 编码
 upload_chain_node() {
-    local upload_url=$1 host=$2 port=$3 user=$4 pass=$5
+    local upload_url=$1 host=$2 port=$3 user=$4 pass=$5 node_name=${6:-}
     local eu ep uplink body code ok stage err name nip rtime
     install_soft jq
     eu=$(printf '%s' "$user" | jq -sRr @uri)
     ep=$(printf '%s' "$pass" | jq -sRr @uri)
     uplink="socks5://$eu:$ep@$host:$port"
-    body=$(jq -n --arg url "$uplink" '{url: $url}')
+    # 带上 name 面板就用它当节点名；不传则面板按落地地区自动命名(如"🇺🇸 美国")
+    if [ -n "$node_name" ]; then
+        body=$(jq -n --arg url "$uplink" --arg name "$node_name" '{url: $url, name: $name}')
+    else
+        body=$(jq -n --arg url "$uplink" '{url: $url}')
+    fi
     echo -e "${yellow}正在上传节点到链式代理面板（最长 45 秒，面板会实测一次代理）...${re}"
     code=$(curl -s --max-time 45 -o /tmp/chain-resp.json -w '%{http_code}' \
         -X POST "$upload_url" -H "Content-Type: application/json" -d "$body" 2>/dev/null)
@@ -1723,14 +1728,23 @@ install_socks5() {
     #   失败时自动换另一个栈重试一次)。
     #   节点输出不受影响,始终双栈都列出(哪个通列哪个)。
     if [ -n "$upload_url" ]; then
-        local candidates=() tried=""
+        local candidates=() tried="" node_name
+        # 上传的节点名与本地节点名保持一致(如 US-Durham-SOCKS5)；
+        # 单栈时补 -V4 / -V6 后缀，避免双栈机器上传后两条重名。
+        if [ -n "$host4" ] && [ -z "$host6" ]; then
+            node_name="$isp-SOCKS5-V4"
+        elif [ -n "$host6" ] && [ -z "$host4" ]; then
+            node_name="$isp-SOCKS5-V6"
+        else
+            node_name="$isp-SOCKS5"
+        fi
         if [ -n "$host4" ]; then candidates+=("$host4"); fi
         if [ -n "$host6" ]; then candidates+=("[$host6]"); fi
         if [ "${#candidates[@]}" -eq 0 ]; then
             echo -e "${red}跳过上传: 探测不到本机公网 IPv4/IPv6 地址${re}"
         else
             for up_host in "${candidates[@]}"; do
-                if upload_chain_node "$upload_url" "$up_host" "$port" "$user" "$pass"; then
+                if upload_chain_node "$upload_url" "$up_host" "$port" "$user" "$pass" "$node_name"; then
                     break
                 fi
                 tried="$tried $up_host"
