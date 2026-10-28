@@ -806,11 +806,15 @@ is_warp_ip() { # $1=ip
 }
 
 # 公网 IP：IPv4 -> IPv6(自动加方括号) -> 网卡。busybox 兼容，不用 grep -oP
-# WARP 的地址一律丢弃：它不代表机器真实地区，节点名会算错。
+# WARP 的地址一律丢弃：它不代表机器真实地区，节点名会算错，客户端也连不进来。
 get_public_ip() {
     local ip=""
     ip=$(curl -s --max-time 5 https://ipv4.ip.sb 2>/dev/null | tr -d '[:space:]')
     printf '%s' "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || ip=""
+    # v4 落在 Cloudflare 自家网段 = WARP 出口，不是机器入站地址，丢弃
+    if [ -n "$ip" ] && is_cloudflare_egress "$ip"; then
+        ip=""
+    fi
     if [ -z "$ip" ]; then
         ip=$(curl -s --max-time 5 https://ipv6.ip.sb 2>/dev/null | tr -d '[:space:]')
         case "$ip" in
@@ -1641,18 +1645,17 @@ sb_selftest() { # $1=端口 $2=用户名 $3=密码
     return 1
 }
 
-# WARP 的 v4 出口落在 Cloudflare 网段(AS13335)。机器公网 IP 自己属于
-# Cloudflare 的概率极低(Cloudflare 不卖算力)，所以查 ipinfo 归属:
-# 出口 IP 归属 Cloudflare = 走了 WARP，那不是机器入站地址，必须丢弃。
-# 归属查询失败(网络不通)时保留 IP，宁交给面板实测，不可本地误杀。
+# WARP 的 v4 出口落在 Cloudflare 自家网段。104.16.0.0/12 (104.16.0.0-104.31.255.255)
+# 整块注册在 Cloudflare, Inc. 名下(RDAP 可查)，CF 不卖 VPS，机器公网 IP 落在里面
+# 只能是 WARP 出口——不是机器入站地址，必须丢弃。
+# 前缀匹配是本地判定，不依赖外部查询；旧版只查 ipinfo 归属，查询超时/被墙时
+# 按"宁交给面板实测"保留 IP，结果 WARP 地址被传上去，面板测不通白白浪费一次上传。
 is_cloudflare_egress() { # $1=ipv4  返回0=WARP出口
-    local org
-    org=$(curl -s --max-time 6 "https://ipinfo.io/$1/org" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    case "$org" in
-        "" ) return 1 ;;
-        *cloudflare*|*as13335*|*13335*) return 0 ;;
-        *) return 1 ;;
+    local ip=$1 a b
+    case "$ip" in
+        104.1[6-9].*|104.2[0-9].*|104.3[01].*) return 0 ;;
     esac
+    return 1
 }
 
 # SOCKS5 用:分别探测公网 IPv4 / IPv6(排除 WARP 出口)。
